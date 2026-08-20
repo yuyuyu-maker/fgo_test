@@ -11,6 +11,12 @@ import torch.nn as nn
 from typing import TYPE_CHECKING
 
 from isaaclab_fpo.utils import resolve_nn_activation
+from isaaclab_fpo.modules.reflow_extensions import (
+    StepPredictor,
+    compute_advantage_reflow_weights,
+    compute_discretization_gap,
+    compute_path_straightness,
+)
 
 if TYPE_CHECKING:
     from isaaclab_fpo.rl_cfg import FpoRslRlPpoActorCriticCfg
@@ -108,6 +114,19 @@ class ActorCritic(nn.Module):
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
 
+        self.adaptive_compute_enabled = cfg.adaptive_compute_enabled
+        self.adaptive_step_bins = list(cfg.adaptive_step_bins)
+        if self.adaptive_compute_enabled:
+            self.step_predictor = StepPredictor(
+                num_obs=num_actor_obs,
+                step_bins=self.adaptive_step_bins,
+            )
+            print(
+                f"StepPredictor enabled with bins={self.adaptive_step_bins}"
+            )
+        else:
+            self.step_predictor = None
+
         # Compile the inner flow integration loop for CUDA graph replay.
         # Cached CUDA graph can lead to a 3~9x speedup.
         self._compiled_integrate_flow = torch.compile(
@@ -143,8 +162,6 @@ class ActorCritic(nn.Module):
         x_t = self._compiled_integrate_flow(
             observations, x_t, t_current, dt, flow_steps
         )
-
-        # Scale actions
         actions = self.actor_scale * x_t
 
         # Perturb action with random noise, this can be interpreted as an entropy regularizer
@@ -211,6 +228,215 @@ class ActorCritic(nn.Module):
         assert loss.shape == (batch_dims, n_samples_per_action)
 
         return loss, x1_pred, x0_pred
+
+    def get_reflow_loss(
+        self,
+        observations: torch.Tensor,
+        n_samples_per_obs: int,
+        advantages: torch.Tensor | None = None,
+        reflow_mode: str = "uniform",
+        advantage_threshold: float = 0.0,
+        endpoint_actor: torch.nn.Module | None = None,
+    ) -> torch.Tensor:
+        """Rectified Flow reflow loss on straight paths between noise and flow endpoints."""
+        assert len(observations.shape) == 2
+        batch_size, action_dim = observations.shape[0], self.num_actions
+        device = observations.device
+
+        x0 = torch.randn(
+            batch_size, n_samples_per_obs, action_dim, device=device
+        )
+        flat_obs = observations[:, None, :].expand(
+            batch_size, n_samples_per_obs, -1
+        ).reshape(batch_size * n_samples_per_obs, -1)
+        flat_x0 = x0.reshape(batch_size * n_samples_per_obs, action_dim)
+
+        integration_actor = endpoint_actor if endpoint_actor is not None else self.actor
+        with torch.no_grad():
+            t_current, dt, flow_steps = self._flow_integration_grid(
+                device, self.sampling_steps
+            )
+            x1_prime = self._integrate_flow_with_actor(
+                integration_actor,
+                flat_obs,
+                flat_x0,
+                t_current,
+                dt,
+                flow_steps,
+            )
+        x1_prime = x1_prime.reshape(batch_size, n_samples_per_obs, action_dim)
+
+        uniform_t = torch.rand(
+            batch_size, n_samples_per_obs, 1, device=device
+        )
+        beta = self.cfm_loss_t_inverse_cdf_beta
+        t = 0.005 + 0.99 * (1.0 - (1.0 - uniform_t) ** (1.0 / beta))
+
+        x_t = t * x0 + (1.0 - t) * x1_prime
+        target_velocity = x0 - x1_prime
+
+        embedded_t = self._embed_timestep(t)
+        obs_expanded = observations[:, None, :].expand(
+            batch_size, n_samples_per_obs, -1
+        )
+        mlp_output = self.actor(
+            torch.cat([obs_expanded, embedded_t, x_t], dim=-1)
+        )
+        velocity_pred = self.mlp_output_scale * mlp_output
+
+        per_sample_loss = self._compute_squared_error(
+            velocity_pred, target_velocity
+        )
+
+        if reflow_mode in {"reward_aware", "fpo_operator"} and advantages is not None:
+            sample_weights = compute_advantage_reflow_weights(
+                advantages, reflow_mode, advantage_threshold
+            )
+            obs_weights = sample_weights[:, None].expand_as(per_sample_loss)
+            return (obs_weights * per_sample_loss).sum() / (
+                obs_weights.sum() + 1e-8
+            )
+        return per_sample_loss.mean()
+
+    def get_adaptive_compute_loss(
+        self,
+        observations: torch.Tensor,
+        advantages: torch.Tensor | None = None,
+        latency_penalty_coef: float = 1.0,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Train step predictor: match low-step actions to full-step actions with latency penalty."""
+        if self.step_predictor is None:
+            zero = torch.tensor(0.0, device=observations.device)
+            return zero, {}
+
+        batch_size = observations.shape[0]
+        device = observations.device
+        x0 = torch.zeros(batch_size, self.num_actions, device=device)
+
+        with torch.no_grad():
+            t_full, dt_full, steps_full = self._flow_integration_grid(
+                device, self.sampling_steps
+            )
+            action_full = self._integrate_flow(
+                observations, x0, t_full, dt_full, steps_full
+            )
+
+        pred_steps = self.step_predictor.predict_steps(observations)
+        action_low = torch.zeros_like(action_full)
+        for steps in self.adaptive_step_bins:
+            mask = pred_steps == steps
+            if not mask.any():
+                continue
+            t_k, dt_k, flow_steps = self._flow_integration_grid(device, int(steps))
+            action_low[mask] = self._integrate_flow(
+                observations[mask], x0[mask], t_k, dt_k, flow_steps
+            )
+
+        fidelity_loss = (action_low - action_full).pow(2).mean()
+        latency_penalty = self.step_predictor.expected_step_fraction(observations).mean()
+        adv_bonus = torch.tensor(0.0, device=device)
+        if advantages is not None:
+            adv_bonus = torch.clamp(advantages.reshape(-1), min=0.0).mean()
+
+        loss = fidelity_loss + latency_penalty_coef * latency_penalty - 0.1 * adv_bonus
+        metrics = {
+            "adaptive_fidelity_loss": fidelity_loss.item(),
+            "adaptive_latency_penalty": latency_penalty.item(),
+            "adaptive_mean_steps": pred_steps.float().mean().item(),
+        }
+        return loss, metrics
+
+    @torch.no_grad()
+    def compute_theory_metrics(
+        self,
+        observations: torch.Tensor,
+        n_samples_per_obs: int = 1,
+    ) -> dict[str, float]:
+        """Theory hooks: straightness and discretization error proxies."""
+        batch_size, action_dim = observations.shape[0], self.num_actions
+        device = observations.device
+        x0 = torch.zeros(batch_size, n_samples_per_obs, action_dim, device=device)
+        flat_obs = observations[:, None, :].expand(
+            batch_size, n_samples_per_obs, -1
+        ).reshape(batch_size * n_samples_per_obs, -1)
+        flat_x0 = x0.reshape(batch_size * n_samples_per_obs, action_dim)
+
+        t_full, dt_full, steps_full = self._flow_integration_grid(
+            device, self.sampling_steps
+        )
+        x1 = self._integrate_flow(flat_obs, flat_x0, t_full, dt_full, steps_full)
+        x1 = x1.reshape(batch_size, n_samples_per_obs, action_dim)
+
+        t_mid = torch.full((batch_size, n_samples_per_obs, 1), 0.5, device=device)
+        x_t = t_mid * x0 + (1.0 - t_mid) * x1
+        target_velocity = x0 - x1
+        embedded_t = self._embed_timestep(t_mid)
+        obs_expanded = observations[:, None, :].expand(
+            batch_size, n_samples_per_obs, -1
+        )
+        velocity_pred = self.mlp_output_scale * self.actor(
+            torch.cat([obs_expanded, embedded_t, x_t], dim=-1)
+        )
+
+        straightness = compute_path_straightness(
+            x0, x1, velocity_pred
+        ).mean().item()
+
+        metrics = {"path_straightness": straightness}
+        for low_steps in (1, 4, 8, 16):
+            if low_steps >= self.sampling_steps:
+                continue
+            t_k, dt_k, flow_steps = self._flow_integration_grid(device, low_steps)
+            x1_low = self._integrate_flow(
+                flat_obs, flat_x0, t_k, dt_k, flow_steps
+            ).reshape(batch_size, n_samples_per_obs, action_dim)
+            gap = compute_discretization_gap(x1, x1_low).mean().item()
+            metrics[f"discretization_gap_{low_steps}"] = gap
+        return metrics
+
+    def _integrate_flow_with_actor(
+        self,
+        actor: torch.nn.Module,
+        observations: torch.Tensor,
+        x_t: torch.Tensor,
+        t_current: torch.Tensor,
+        dt: torch.Tensor,
+        flow_steps: int,
+    ) -> torch.Tensor:
+        """Flow integration using an alternate actor module (e.g., EMA snapshot)."""
+        batch_size = observations.shape[0]
+        half_dim = self.timestep_embed_dim // 2
+        freqs = 2 ** torch.arange(
+            half_dim, device=observations.device, dtype=observations.dtype
+        )
+        for i in range(flow_steps):
+            t_val = t_current[i].reshape(1, 1)
+            scaled_t = t_val * freqs
+            embedded_t = torch.cat([torch.cos(scaled_t), torch.sin(scaled_t)], dim=-1)
+            embedded_t = embedded_t.expand(batch_size, -1)
+            mlp_output = actor(torch.cat([observations, embedded_t, x_t], dim=-1))
+            mlp_output = self.mlp_output_scale * mlp_output
+            x_t = x_t + mlp_output * dt[i]
+        return x_t
+
+    def get_reflow_loss_legacy(
+        self,
+        observations: torch.Tensor,
+        n_samples_per_obs: int,
+    ) -> torch.Tensor:
+        """Legacy uniform reflow loss (wrapper)."""
+        return self.get_reflow_loss(
+            observations, n_samples_per_obs, reflow_mode="uniform"
+        )
+
+    def _flow_integration_grid(
+        self, device: torch.device, flow_steps: int
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Return (t_current, dt, flow_steps) for Euler integration t: 1 -> 0."""
+        full_t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=device)
+        t_current = full_t_path[:-1]
+        dt = full_t_path[1:] - full_t_path[:-1]
+        return t_current, dt, flow_steps
 
     def _embed_timestep(self, t: torch.Tensor) -> torch.Tensor:
         """Embed (*, 1) timestep into (*, timestep_embed_dim)."""

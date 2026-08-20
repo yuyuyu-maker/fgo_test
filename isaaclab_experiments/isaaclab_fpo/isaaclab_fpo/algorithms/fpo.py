@@ -109,7 +109,28 @@ class FPO:
         self.advantage_clamp = cfg.advantage_clamp
         self.storage_action_noise_std = cfg.storage_action_noise_std
         self.trust_region_mode = cfg.trust_region_mode
+        self.reflow_enabled = cfg.reflow_enabled
+        self.reflow_loss_coef = cfg.reflow_loss_coef
+        self.reflow_n_samples_per_obs = cfg.reflow_n_samples_per_obs
+        self.reflow_mode = cfg.reflow_mode
+        self.reflow_advantage_threshold = cfg.reflow_advantage_threshold
+        self.reflow_use_ema_endpoint = cfg.reflow_use_ema_endpoint
+        self.theory_metrics_enabled = cfg.theory_metrics_enabled
+        self.adaptive_compute_enabled = cfg.adaptive_compute_enabled
+        self.adaptive_compute_loss_coef = cfg.adaptive_compute_loss_coef
+        self.adaptive_latency_penalty_coef = cfg.adaptive_latency_penalty_coef
         self.update_counter = 0
+        self._last_theory_metrics: dict[str, float] = {}
+        self._last_adaptive_metrics: dict[str, float] = {}
+        if self.reflow_enabled:
+            print(
+                f"Rectified Flow reflow enabled: mode={self.reflow_mode}, "
+                f"coef={self.reflow_loss_coef}, "
+                f"n_samples_per_obs={self.reflow_n_samples_per_obs}, "
+                f"ema_endpoint={self.reflow_use_ema_endpoint}, "
+                f"theory_metrics={self.theory_metrics_enabled}, "
+                f"adaptive_compute={self.adaptive_compute_enabled}"
+            )
 
     def init_storage(
         self,
@@ -273,6 +294,8 @@ class FPO:
     def update(self, obs_normalizer=None, privileged_obs_normalizer=None):  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
+        mean_reflow_loss = 0
+        mean_adaptive_compute_loss = 0
         mean_entropy = 0
         mean_kl = 0
 
@@ -496,7 +519,45 @@ class FPO:
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
+            reflow_loss = torch.tensor(0.0, device=self.device)
+            if self.reflow_enabled:
+                if self.reflow_use_ema_endpoint and self.ema is not None:
+                    self.ema.store(self.policy.actor)
+                    self.ema.copy_to(self.policy.actor)
+                try:
+                    reflow_loss = self.policy.get_reflow_loss(
+                        obs_batch,
+                        self.reflow_n_samples_per_obs,
+                        advantages=advantages_batch
+                        if self.reflow_mode in {"reward_aware", "fpo_operator"}
+                        else None,
+                        reflow_mode=self.reflow_mode,
+                        advantage_threshold=self.reflow_advantage_threshold,
+                    )
+                finally:
+                    if self.reflow_use_ema_endpoint and self.ema is not None:
+                        self.ema.restore(self.policy.actor)
+
+                if self.theory_metrics_enabled and mini_batch_step == 0:
+                    self._last_theory_metrics = self.policy.compute_theory_metrics(
+                        obs_batch[: min(256, obs_batch.shape[0])]
+                    )
+
+            adaptive_loss = torch.tensor(0.0, device=self.device)
+            if self.adaptive_compute_enabled:
+                adaptive_loss, self._last_adaptive_metrics = (
+                    self.policy.get_adaptive_compute_loss(
+                        obs_batch,
+                        advantages=advantages_batch,
+                        latency_penalty_coef=self.adaptive_latency_penalty_coef,
+                    )
+                )
+
             loss = surrogate_loss + self.value_loss_coef * value_loss
+            if self.reflow_enabled:
+                loss = loss + self.reflow_loss_coef * reflow_loss
+            if self.adaptive_compute_enabled:
+                loss = loss + self.adaptive_compute_loss_coef * adaptive_loss
             if entropy_bonus is not None:
                 loss -= self.knn_entropy_coef * entropy_bonus
 
@@ -535,6 +596,10 @@ class FPO:
             # Store the losses
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
+            if self.reflow_enabled:
+                mean_reflow_loss += reflow_loss.item()
+            if self.adaptive_compute_enabled:
+                mean_adaptive_compute_loss += adaptive_loss.item()
             mean_entropy += entropy_bonus.item() if entropy_bonus is not None else 0.0
 
             mini_batch_step += 1
@@ -543,6 +608,10 @@ class FPO:
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
+        if self.reflow_enabled:
+            mean_reflow_loss /= num_updates
+        if self.adaptive_compute_enabled:
+            mean_adaptive_compute_loss /= num_updates
         mean_entropy /= num_updates
         if self.schedule == "adaptive":
             mean_kl /= num_updates
@@ -557,6 +626,15 @@ class FPO:
             "surrogate_loss": mean_surrogate_loss,
             "value_loss": mean_value_loss,
         }
+        if self.reflow_enabled:
+            loss_dict["reflow_loss"] = mean_reflow_loss
+        if self.adaptive_compute_enabled:
+            loss_dict["adaptive_compute_loss"] = mean_adaptive_compute_loss
+            for key, value in self._last_adaptive_metrics.items():
+                loss_dict[key] = value
+        if self.theory_metrics_enabled:
+            for key, value in self._last_theory_metrics.items():
+                loss_dict[key] = value
         if self.knn_entropy_coef > 0:
             loss_dict["entropy_loss"] = mean_entropy
 

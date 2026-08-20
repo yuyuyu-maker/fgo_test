@@ -32,6 +32,90 @@ class UnitreeGo2FlatFlowPPORunnerCfg(FpoRslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class UnitreeGo2FlatFlowPPORunnerCfgReflow(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Go2 with Rectified Flow reflow auxiliary loss enabled."""
+
+    experiment_name = "unitree_go2_flat_flow_reflow"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+    )
+
+
+@configclass
+class UnitreeGo2FlatFlowPPORunnerCfgRewardAware(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Idea 1: reward-aware rectification on high-advantage samples."""
+
+    experiment_name = "unitree_go2_reflow_reward_aware"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="reward_aware",
+        reflow_advantage_threshold=0.0,
+    )
+
+
+@configclass
+class UnitreeGo2FlatFlowPPORunnerCfgAdaptiveCompute(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Idea 2: state-adaptive compute via step predictor."""
+
+    experiment_name = "unitree_go2_reflow_adaptive_compute"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        adaptive_compute_enabled=True,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        adaptive_compute_enabled=True,
+        adaptive_compute_loss_coef=0.1,
+        adaptive_latency_penalty_coef=1.0,
+    )
+
+
+@configclass
+class UnitreeGo2FlatFlowPPORunnerCfgFpoOperator(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Idea 3: FPO++-compatible reflow as policy-improvement operator."""
+
+    experiment_name = "unitree_go2_reflow_fpo_operator"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="fpo_operator",
+        reflow_use_ema_endpoint=True,
+    )
+
+
+@configclass
+class UnitreeGo2FlatFlowPPORunnerCfgTheory(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Idea 4: theory hooks — log path straightness and discretization gaps."""
+
+    experiment_name = "unitree_go2_reflow_theory"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        theory_metrics_enabled=True,
+    )
+
+
+GO2_FPO_VARIANTS = {
+    "baseline": UnitreeGo2FlatFlowPPORunnerCfg,
+    "reflow": UnitreeGo2FlatFlowPPORunnerCfgReflow,
+    "reward_aware": UnitreeGo2FlatFlowPPORunnerCfgRewardAware,
+    "adaptive_compute": UnitreeGo2FlatFlowPPORunnerCfgAdaptiveCompute,
+    "fpo_operator": UnitreeGo2FlatFlowPPORunnerCfgFpoOperator,
+    "theory": UnitreeGo2FlatFlowPPORunnerCfgTheory,
+}
+
+@configclass
 class SpotFlatFlowPPORunnerCfg(FpoRslRlOnPolicyRunnerCfg):
     """Spot quadruped: 32 samples, 32 epochs, value_loss_coef=0.5, 1500 iters."""
 

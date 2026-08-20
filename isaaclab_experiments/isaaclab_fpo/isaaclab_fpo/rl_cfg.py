@@ -103,6 +103,15 @@ class FpoRslRlPpoActorCriticCfg:
     Perturbs actions with random noise, which can be interpreted as an entropy
     regularizer."""
 
+    adaptive_compute_enabled: bool = False
+    """Enable step predictor head on the actor for state-adaptive compute."""
+
+    adaptive_step_bins: list[int] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.adaptive_step_bins is None:
+            self.adaptive_step_bins = [1, 4, 8, 16, 64]
+
 
 ############################
 # Algorithm configurations #
@@ -305,6 +314,47 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     to stabilize before starting exponential averaging. Only applies when ema_decay > 0.
     Set to 0 to start EMA immediately from the first update.
     """
+
+    reflow_enabled: bool = False
+    """Enable Rectified Flow reflow auxiliary loss (Liu et al., 2022).
+
+    When True, adds a straight-path CFM loss on coupled (noise, flow-generated action) pairs.
+    This encourages straighter transport and can reduce required inference steps. Default is False.
+    """
+
+    reflow_loss_coef: float = 1.0
+    """Coefficient for the reflow auxiliary loss when reflow_enabled is True."""
+
+    reflow_n_samples_per_obs: int = 4
+    """Number of reflow (noise, endpoint) pairs sampled per observation in each mini-batch."""
+
+    reflow_mode: Literal["uniform", "reward_aware", "fpo_operator"] = "uniform"
+    """How to weight reflow samples: uniform, advantage-weighted, or FPO++ operator-style."""
+
+    reflow_advantage_threshold: float = 0.0
+    """Minimum advantage for reward-aware reflow weighting."""
+
+    reflow_use_ema_endpoint: bool = False
+    """Use EMA actor weights (detached) to generate reflow endpoints (policy improvement operator)."""
+
+    theory_metrics_enabled: bool = False
+    """Log path straightness and discretization error proxies during training."""
+
+    adaptive_compute_enabled: bool = False
+    """Train a step predictor for state-adaptive integration budgets."""
+
+    adaptive_compute_loss_coef: float = 0.1
+    """Overall coefficient for adaptive compute loss."""
+
+    adaptive_latency_penalty_coef: float = 1.0
+    """Trade-off between action fidelity and predicted integration steps inside adaptive loss."""
+
+    adaptive_step_bins: list[int] = None  # type: ignore[assignment]
+    """Discrete integration budgets for the step predictor. Default set in __post_init__."""
+
+    def __post_init__(self):
+        if self.adaptive_step_bins is None:
+            self.adaptive_step_bins = [1, 4, 8, 16, 64]
 
 
 #########################

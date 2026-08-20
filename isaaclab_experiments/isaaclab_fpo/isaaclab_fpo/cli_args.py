@@ -22,6 +22,20 @@ def add_fpo_args(parser: argparse.ArgumentParser):
         "--logger", type=str, default=None, choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use."
     )
     arg_group.add_argument(
+        "--fpo_variant",
+        type=str,
+        default=None,
+        choices={
+            "baseline",
+            "reflow",
+            "reward_aware",
+            "adaptive_compute",
+            "fpo_operator",
+            "theory",
+        },
+        help="Go2 FPO config variant (overrides default task config when set).",
+    )
+    arg_group.add_argument(
         "--log_project_name", type=str, default=None, help="Name of the logging project when using wandb or neptune."
     )
 
@@ -31,16 +45,23 @@ def parse_fpo_cfg(task_name: str, args_cli: argparse.Namespace) -> FpoRslRlOnPol
 
     Looks up the task config from the isaaclab_fpo registry instead of gym kwargs.
     """
-    from isaaclab_fpo.task_cfgs import TASK_CONFIGS
+    from isaaclab_fpo.task_cfgs import GO2_FPO_VARIANTS, TASK_CONFIGS
 
-    if task_name not in TASK_CONFIGS:
+    if hasattr(args_cli, "fpo_variant") and args_cli.fpo_variant is not None:
+        if args_cli.fpo_variant not in GO2_FPO_VARIANTS:
+            raise KeyError(
+                f"Unknown fpo_variant '{args_cli.fpo_variant}'. "
+                f"Available: {sorted(GO2_FPO_VARIANTS.keys())}"
+            )
+        agent_cfg = GO2_FPO_VARIANTS[args_cli.fpo_variant]()
+    elif task_name not in TASK_CONFIGS:
         raise KeyError(
             f"No FPO config registered for task '{task_name}'. "
             f"Available tasks: {sorted(TASK_CONFIGS.keys())}"
         )
-    agent_cfg = TASK_CONFIGS[task_name]()
-    agent_cfg = update_fpo_cfg(agent_cfg, args_cli)
-    return agent_cfg
+    else:
+        agent_cfg = TASK_CONFIGS[task_name]()
+    return update_fpo_cfg(agent_cfg, args_cli)
 
 
 def update_fpo_cfg(agent_cfg: FpoRslRlOnPolicyRunnerCfg, args_cli: argparse.Namespace):
@@ -57,6 +78,8 @@ def update_fpo_cfg(agent_cfg: FpoRslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.load_checkpoint = args_cli.checkpoint
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
+    if hasattr(args_cli, "experiment_name") and args_cli.experiment_name is not None:
+        agent_cfg.experiment_name = args_cli.experiment_name
     if args_cli.logger is not None:
         agent_cfg.logger = args_cli.logger
     if agent_cfg.logger in {"wandb", "neptune"} and args_cli.log_project_name:
