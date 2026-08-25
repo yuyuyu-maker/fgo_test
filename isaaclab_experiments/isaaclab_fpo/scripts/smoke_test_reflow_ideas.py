@@ -51,7 +51,15 @@ def test_actor_critic_variants():
     obs = torch.randn(batch, obs_dim)
     adv = torch.randn(batch, 1)
 
-    for name in ("reflow", "reward_aware", "adaptive_compute", "fpo_operator", "theory", "all_ideas"):
+    for name in (
+        "reflow",
+        "reflow_random_x0",
+        "reward_aware",
+        "adaptive_compute",
+        "fpo_operator",
+        "theory",
+        "all_ideas",
+    ):
         variant = GO2_FPO_VARIANTS[name]()
         cfg = variant.policy
         policy = ActorCritic(obs_dim, critic_dim, act_dim, cfg)
@@ -71,6 +79,18 @@ def test_actor_critic_variants():
             loss, metrics = policy.get_adaptive_compute_loss(obs, advantages=adv)
             assert torch.isfinite(loss).all(), f"{name} adaptive loss not finite"
             assert "adaptive_mean_steps" in metrics
+
+        if variant.algorithm.random_x0_consistency_enabled:
+            loss, metrics = policy.get_random_x0_consistency_loss(
+                obs,
+                step_bins=variant.algorithm.random_x0_consistency_steps,
+            )
+            assert torch.isfinite(loss).all(), f"{name} random_x0 loss not finite"
+            assert "random_x0_consistency_loss" in metrics
+            # mix mode should produce both zero and random starts
+            if cfg.train_flow_x0_mode == "mix":
+                x0 = policy._sample_train_flow_x0(64, obs.device)
+                assert x0.shape == (64, act_dim)
 
         if variant.algorithm.theory_metrics_enabled:
             metrics = policy.compute_theory_metrics(obs[:8])

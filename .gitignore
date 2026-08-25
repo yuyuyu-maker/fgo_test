@@ -115,6 +115,12 @@ isaaclab_experiments/whole_body_tracking_reference_data/**
 !isaaclab_experiments/whole_body_tracking_reference_data/*.md
 !isaaclab_experiments/whole_body_tracking_reference_data/README.md
 
+# Go2 deploy: local SDK clones (have their own .git; install via scripts/setup_unitree_sdk2.sh)
+go2_deploy/thirdparty/cyclonedds/
+go2_deploy/thirdparty/unitree_sdk2_python/
+go2_deploy/.venv*/
+go2_deploy/thirdparty/unitree_rl_lab/
+
 # Manipulation: heavy local installs / forks
 manipulation_experiments/thirdparty/miniconda3/
 manipulation_experiments/thirdparty/dexmimicgen/

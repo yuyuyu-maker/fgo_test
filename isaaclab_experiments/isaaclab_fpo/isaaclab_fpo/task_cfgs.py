@@ -44,6 +44,29 @@ class UnitreeGo2FlatFlowPPORunnerCfgReflow(UnitreeGo2FlatFlowPPORunnerCfg):
 
 
 @configclass
+class UnitreeGo2FlatFlowPPORunnerCfgReflowRandomX0(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Reflow + random-x0 few-step consistency (close PostEval random gap)."""
+
+    experiment_name = "unitree_go2_reflow_random_x0"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        train_flow_x0_mode="mix",
+        train_flow_x0_random_prob=0.5,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        random_x0_consistency_enabled=True,
+        random_x0_consistency_coef=0.1,
+        random_x0_consistency_steps=[1, 4, 8],
+    )
+
+
+@configclass
 class UnitreeGo2FlatFlowPPORunnerCfgRewardAware(UnitreeGo2FlatFlowPPORunnerCfg):
     """Idea 1: reward-aware rectification on high-advantage samples."""
 
@@ -134,6 +157,7 @@ class UnitreeGo2FlatFlowPPORunnerCfgAllIdeas(UnitreeGo2FlatFlowPPORunnerCfg):
 GO2_FPO_VARIANTS = {
     "baseline": UnitreeGo2FlatFlowPPORunnerCfg,
     "reflow": UnitreeGo2FlatFlowPPORunnerCfgReflow,
+    "reflow_random_x0": UnitreeGo2FlatFlowPPORunnerCfgReflowRandomX0,
     "reward_aware": UnitreeGo2FlatFlowPPORunnerCfgRewardAware,
     "adaptive_compute": UnitreeGo2FlatFlowPPORunnerCfgAdaptiveCompute,
     "fpo_operator": UnitreeGo2FlatFlowPPORunnerCfgFpoOperator,
@@ -234,8 +258,35 @@ class SpotFlatFlowPPORunnerCfgTheory(SpotFlatFlowPPORunnerCfg):
     )
 
 
+@configclass
+class SpotFlatFlowPPORunnerCfgReflowRandomX0(SpotFlatFlowPPORunnerCfg):
+    """Spot: reflow + random-x0 few-step consistency."""
+
+    experiment_name = "spot_reflow_random_x0"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        train_flow_x0_mode="mix",
+        train_flow_x0_random_prob=0.5,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        value_loss_coef=0.5,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        random_x0_consistency_enabled=True,
+        random_x0_consistency_coef=0.1,
+        random_x0_consistency_steps=[1, 4, 8],
+    )
+
+
 SPOT_FPO_VARIANTS = {
     "baseline": SpotFlatFlowPPORunnerCfg,
+    "reflow_random_x0": SpotFlatFlowPPORunnerCfgReflowRandomX0,
     "reward_aware": SpotFlatFlowPPORunnerCfgRewardAware,
     "adaptive_compute": SpotFlatFlowPPORunnerCfgAdaptiveCompute,
     "fpo_operator": SpotFlatFlowPPORunnerCfgFpoOperator,
@@ -282,6 +333,155 @@ class G1FlatFlowPPORunnerCfg(FpoRslRlOnPolicyRunnerCfg):
         n_samples_per_action=32,
         num_learning_epochs=32,
     )
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgReflow(G1FlatFlowPPORunnerCfg):
+    """G1 with Rectified Flow reflow auxiliary loss enabled."""
+
+    experiment_name = "g1_flat_flow_reflow"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+    )
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgReflowRandomX0(G1FlatFlowPPORunnerCfg):
+    """G1: reflow + random-x0 few-step consistency."""
+
+    experiment_name = "g1_reflow_random_x0"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        train_flow_x0_mode="mix",
+        train_flow_x0_random_prob=0.5,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        random_x0_consistency_enabled=True,
+        random_x0_consistency_coef=0.1,
+        random_x0_consistency_steps=[1, 4, 8],
+    )
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgRewardAware(G1FlatFlowPPORunnerCfg):
+    """G1 idea 1: reward-aware rectification on high-advantage samples."""
+
+    experiment_name = "g1_reflow_reward_aware"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="reward_aware",
+        reflow_advantage_threshold=0.0,
+    )
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgAdaptiveCompute(G1FlatFlowPPORunnerCfg):
+    """G1 idea 2: state-adaptive compute via step predictor."""
+
+    experiment_name = "g1_reflow_adaptive_compute"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        adaptive_compute_enabled=True,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        adaptive_compute_enabled=True,
+        adaptive_compute_loss_coef=0.1,
+        adaptive_latency_penalty_coef=1.0,
+    )
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgFpoOperator(G1FlatFlowPPORunnerCfg):
+    """G1 idea 3: FPO++-compatible reflow as policy-improvement operator."""
+
+    experiment_name = "g1_reflow_fpo_operator"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="fpo_operator",
+        reflow_use_ema_endpoint=True,
+    )
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgTheory(G1FlatFlowPPORunnerCfg):
+    """G1 idea 4: theory hooks — log path straightness and discretization gaps."""
+
+    experiment_name = "g1_reflow_theory"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        theory_metrics_enabled=True,
+    )
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgAllIdeas(G1FlatFlowPPORunnerCfg):
+    """G1 stack: reward_aware + adaptive_compute + theory (no fpo_operator)."""
+
+    experiment_name = "g1_reflow_all_ideas"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        adaptive_compute_enabled=True,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="reward_aware",
+        reflow_advantage_threshold=0.0,
+        theory_metrics_enabled=True,
+        adaptive_compute_enabled=True,
+        adaptive_compute_loss_coef=0.1,
+        adaptive_latency_penalty_coef=1.0,
+    )
+
+
+G1_FPO_VARIANTS = {
+    "baseline": G1FlatFlowPPORunnerCfg,
+    "reflow": G1FlatFlowPPORunnerCfgReflow,
+    "reflow_random_x0": G1FlatFlowPPORunnerCfgReflowRandomX0,
+    "reward_aware": G1FlatFlowPPORunnerCfgRewardAware,
+    "adaptive_compute": G1FlatFlowPPORunnerCfgAdaptiveCompute,
+    "fpo_operator": G1FlatFlowPPORunnerCfgFpoOperator,
+    "theory": G1FlatFlowPPORunnerCfgTheory,
+    "all_ideas": G1FlatFlowPPORunnerCfgAllIdeas,
+}
 
 
 # ---------------------------------------------------------------------------

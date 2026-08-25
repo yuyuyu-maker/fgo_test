@@ -1,0 +1,147 @@
+# Go2 deploy config — switch models by changing `active_model` (or CLI --model).
+# Checkpoint paths are relative to the go2_deploy/ project root (not configs/).
+#
+# Two control modes (shown on the web UI — do not mix):
+#   sport — Unitree built-in Sport gait via SportClient.Move (sdk2 / mock)
+#   fpo   — Your FPO ONNX policy via C++ LowState→ONNX→LowCmd (UDP cmd bridge)
+# Aligned policy numbers: configs/fpo_go2_aligned.yaml
+
+server:
+  host: 127.0.0.1
+  port: 8080
+  deadman_s: 0.35
+  # Web command stream rate (sport backend push / UDP forward), not RL policy rate
+  control_hz: 50.0
+
+# control_mode: sport | fpo  (override with CLI --mode)
+control_mode: sport
+
+# Robot I/O for control_mode=sport only:
+#   mock  — log only
+#   sdk2  — SportClient.Move (built-in gait; NOT FPO)
+# For control_mode=fpo, Python does not drive motors; it only forwards cmds (UDP).
+backend:
+  name: mock
+  iface: eth0
+  max_vx: 0.60
+  max_vy: 0.40
+  max_yaw: 0.80
+
+# --- FPO policy deploy (C++ + ONNX; aligned with Isaac Lab Go2 flat training) ---
+# Source of truth for numbers: configs/fpo_go2_aligned.yaml (from env.yaml)
+policy:
+  # Tunable. Training: decimation=4, sim.dt=0.005 → 50 Hz. Keep 50 unless intentional.
+  policy_hz: 50.0
+  lowcmd_hz: 500.0
+  action_scale: 0.25
+  kp: 25.0
+  kd: 0.5
+  effort_limit: 23.5
+  velocity_limit: 30.0
+  # FL/FR/RL/RR × hip,thigh,calf — see fpo_go2_aligned.yaml
+  default_joint_pos:
+    - 0.1
+    - 0.8
+    - -1.5
+    - -0.1
+    - 0.8
+    - -1.5
+    - 0.1
+    - 1.0
+    - -1.5
+    - -0.1
+    - 1.0
+    - -1.5
+  aligned_yaml: configs/fpo_go2_aligned.yaml
+  # Idle keys → cmd=(0,0,0); policy still runs at policy_hz (zero-vel track)
+  pause_on_idle: false
+  onnx_path: exported/baseline/policy.onnx
+
+# Which entry under `models:` to use (FPO mode)
+active_model: baseline
+
+# FPO Go2 checkpoints (Isaac Lab flat velocity). Update paths when new runs finish.
+models:
+  baseline:
+    description: "Go2 FPO++ baseline (2500 iters)"
+    fpo_variant: baseline
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_flat_flow/2026-08-21_20-43-35_2026-08-21_20-43-28_baseline/model_2499.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+  reflow:
+    description: "Go2 plain reflow aux (2500 iters, coef=1.0)"
+    fpo_variant: reflow
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_flat_flow_reflow/2026-08-24_20-16-32_2026-08-24_20-16-24_reflow/model_2499.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+  reward_aware:
+    description: "Go2 reflow idea: reward_aware"
+    fpo_variant: reward_aware
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_reflow_reward_aware/2026-08-21_20-43-35_2026-08-21_20-43-28_reward_aware/model_2499.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+  adaptive_compute:
+    description: "Go2 reflow idea: adaptive_compute"
+    fpo_variant: adaptive_compute
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_reflow_adaptive_compute/2026-08-21_20-43-35_2026-08-21_20-43-28_adaptive_compute/model_2499.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+  theory:
+    description: "Go2 reflow idea: theory metrics"
+    fpo_variant: theory
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_reflow_theory/2026-08-22_16-47-28_2026-08-21_20-43-28_theory/model_2499.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+  all_ideas:
+    description: "Go2 reflow all_ideas (still training — path may be mid-ckpt)"
+    fpo_variant: all_ideas
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_reflow_all_ideas/2026-08-24_20-16-32_2026-08-24_20-16-24_all_ideas/model_2350.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+  fpo_operator_fixed:
+    description: "Go2 fpo_operator after EMA endpoint fix (in progress)"
+    fpo_variant: fpo_operator
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_reflow_fpo_operator/2026-08-25_12-16-04_2026-08-25_11-52-06_fpo_operator_fixed/model_200.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+  reflow_coef0p1:
+    description: "Reflow coef ablation 0.1 @ 500 iters"
+    fpo_variant: reflow
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_flat_flow_reflow/2026-08-25_09-20-36_2026-08-25_09-20-29_reflow_coef0p1/model_499.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+  reflow_coef0p3:
+    description: "Reflow coef ablation 0.3 @ 500 iters"
+    fpo_variant: reflow
+    task: Isaac-Velocity-Flat-Unitree-Go2-v0
+    checkpoint: ../isaaclab_experiments/logs/isaaclab_fpo/unitree_go2_flat_flow_reflow/2026-08-25_10-16-43_2026-08-25_09-20-29_reflow_coef0p3/model_499.pt
+    sampling_steps: 10
+    zero_sampling: true
+
+unitree_sdk:
+  # Official open-source SDK
+  github: https://github.com/unitreerobotics/unitree_sdk2_python
+  github_cpp: https://github.com/unitreerobotics/unitree_sdk2
+  local_dir: thirdparty/unitree_sdk2_python
+  docs_sport: https://support.unitree.com/home/en/developer/sports_services
+  docs_quickstart: https://support.unitree.com/home/en/developer/Quick_start
+  # Recommended C++ + ONNX deploy (official, Go2 supported):
+  reference_rl_lab: https://github.com/unitreerobotics/unitree_rl_lab
+  # Community Go2-focused CPP deploy (based on unitree_rl_lab):
+  reference_cpp_deploy: https://github.com/wty-yy/unitree_cpp_deploy

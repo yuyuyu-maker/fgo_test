@@ -49,6 +49,8 @@ class ActorCritic(nn.Module):
 
         # Training parameters
         self.action_perturb_std = cfg.action_perturb_std
+        self.train_flow_x0_mode = cfg.train_flow_x0_mode
+        self.train_flow_x0_random_prob = float(cfg.train_flow_x0_random_prob)
         if cfg.training_sampling_steps is not None:
             self.training_sampling_steps = cfg.training_sampling_steps
         else:
@@ -150,7 +152,7 @@ class ActorCritic(nn.Module):
         if not self.training:
             x_t = torch.zeros(size=(batch_size, self.num_actions), device=device)
         else:
-            x_t = torch.randn(size=(batch_size, self.num_actions), device=device)
+            x_t = self._sample_train_flow_x0(batch_size, device)
 
         flow_steps = self.sampling_steps
         full_t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=device)
@@ -297,6 +299,67 @@ class ActorCritic(nn.Module):
                 obs_weights.sum() + 1e-8
             )
         return per_sample_loss.mean()
+
+    def _sample_train_flow_x0(
+        self, batch_size: int, device: torch.device
+    ) -> torch.Tensor:
+        """Sample flow noise for on-policy rollouts according to ``train_flow_x0_mode``."""
+        shape = (batch_size, self.num_actions)
+        if self.train_flow_x0_mode == "zero":
+            return torch.zeros(size=shape, device=device)
+        if self.train_flow_x0_mode == "random":
+            return torch.randn(size=shape, device=device)
+        if self.train_flow_x0_mode == "mix":
+            random_x0 = torch.randn(size=shape, device=device)
+            zero_x0 = torch.zeros(size=shape, device=device)
+            mask = (
+                torch.rand(batch_size, 1, device=device)
+                < self.train_flow_x0_random_prob
+            )
+            return torch.where(mask, random_x0, zero_x0)
+        raise ValueError(f"Unknown train_flow_x0_mode: {self.train_flow_x0_mode}")
+
+    def get_random_x0_consistency_loss(
+        self,
+        observations: torch.Tensor,
+        step_bins: list[int] | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Match few-step actions to full-step actions under a shared random x0.
+
+        Unlike adaptive_compute (which uses zero init + a step predictor), this loss
+        always starts from x0 ~ N(0, I) — the RF hypothesis / PostEval ``random`` mode.
+        """
+        batch_size = observations.shape[0]
+        device = observations.device
+        bins = list(step_bins) if step_bins is not None else [1, 4, 8]
+        bins = [int(s) for s in bins if 0 < int(s) < self.sampling_steps]
+        if not bins:
+            zero = torch.tensor(0.0, device=device)
+            return zero, {}
+
+        x0 = torch.randn(batch_size, self.num_actions, device=device)
+        with torch.no_grad():
+            t_full, dt_full, steps_full = self._flow_integration_grid(
+                device, self.sampling_steps
+            )
+            action_full = self._integrate_flow(
+                observations, x0, t_full, dt_full, steps_full
+            )
+
+        total_loss = torch.tensor(0.0, device=device)
+        metrics: dict[str, float] = {}
+        for steps in bins:
+            t_k, dt_k, flow_steps = self._flow_integration_grid(device, steps)
+            action_low = self._integrate_flow(
+                observations, x0, t_k, dt_k, flow_steps
+            )
+            step_loss = (action_low - action_full).pow(2).mean()
+            total_loss = total_loss + step_loss
+            metrics[f"random_x0_consistency_{steps}"] = step_loss.item()
+
+        loss = total_loss / float(len(bins))
+        metrics["random_x0_consistency_loss"] = loss.item()
+        return loss, metrics
 
     def get_adaptive_compute_loss(
         self,

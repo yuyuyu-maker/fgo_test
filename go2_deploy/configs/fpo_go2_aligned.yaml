@@ -1,0 +1,76 @@
+# Aligned with Isaac Lab Go2 flat FPO training (baseline env.yaml):
+#   logs/.../unitree_go2_flat_flow/.../params/env.yaml
+# and unitree_rl_lab Go2 actuator defaults (kp=25, kd=0.5).
+#
+# Copy / merge into unitree_rl_lab deploy policy params after ONNX export.
+# DO NOT use SportClient.Move with these — that is control_mode: sport.
+
+policy_hz: 50.0          # decimation=4 * sim.dt=0.005
+lowcmd_hz: 500.0
+action_scale: 0.25       # actions.joint_pos.scale
+kp: 25.0                 # actuators.base_legs.stiffness
+kd: 0.5                  # actuators.base_legs.damping
+effort_limit: 23.5
+velocity_limit: 30.0
+
+# Default pose from UNITREE_GO2_CFG.init_state.joint_pos.
+# Policy joint order: typical Isaac Go2 articulation (per-leg hip→thigh→calf).
+# ALWAYS confirm against play.py-exported deploy.yaml before real-robot run.
+joint_names_isaac:
+  - FL_hip_joint
+  - FL_thigh_joint
+  - FL_calf_joint
+  - FR_hip_joint
+  - FR_thigh_joint
+  - FR_calf_joint
+  - RL_hip_joint
+  - RL_thigh_joint
+  - RL_calf_joint
+  - RR_hip_joint
+  - RR_thigh_joint
+  - RR_calf_joint
+
+default_joint_pos:
+  - 0.1    # FL_hip
+  - 0.8    # FL_thigh
+  - -1.5   # FL_calf
+  - -0.1   # FR_hip
+  - 0.8    # FR_thigh
+  - -1.5   # FR_calf
+  - 0.1    # RL_hip
+  - 1.0    # RL_thigh
+  - -1.5   # RL_calf
+  - -0.1   # RR_hip
+  - 1.0    # RR_thigh
+  - -1.5   # RR_calf
+
+# Unitree SDK2 LowCmd motor index order (unitree_rl_lab joint_sdk_names).
+# C++ must remap isaac ↔ sdk when writing LowCmd.
+joint_names_sdk:
+  - FR_hip_joint
+  - FR_thigh_joint
+  - FR_calf_joint
+  - FL_hip_joint
+  - FL_thigh_joint
+  - FL_calf_joint
+  - RR_hip_joint
+  - RR_thigh_joint
+  - RR_calf_joint
+  - RL_hip_joint
+  - RL_thigh_joint
+  - RL_calf_joint
+
+obs:
+  dim: 48
+  layout:
+    - {name: base_lin_vel, dim: 3}
+    - {name: base_ang_vel, dim: 3}
+    - {name: projected_gravity, dim: 3}
+    - {name: velocity_commands, dim: 3}   # (vx, vy, yaw) from web/gamepad
+    - {name: joint_pos_rel, dim: 12}
+    - {name: joint_vel_rel, dim: 12}
+    - {name: last_action, dim: 12}
+
+action:
+  dim: 12
+  formula: "q_des = default_joint_pos + action_scale * action"

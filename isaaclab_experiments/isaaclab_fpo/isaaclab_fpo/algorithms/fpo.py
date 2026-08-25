@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -119,9 +121,13 @@ class FPO:
         self.adaptive_compute_enabled = cfg.adaptive_compute_enabled
         self.adaptive_compute_loss_coef = cfg.adaptive_compute_loss_coef
         self.adaptive_latency_penalty_coef = cfg.adaptive_latency_penalty_coef
+        self.random_x0_consistency_enabled = cfg.random_x0_consistency_enabled
+        self.random_x0_consistency_coef = cfg.random_x0_consistency_coef
+        self.random_x0_consistency_steps = list(cfg.random_x0_consistency_steps)
         self.update_counter = 0
         self._last_theory_metrics: dict[str, float] = {}
         self._last_adaptive_metrics: dict[str, float] = {}
+        self._last_random_x0_metrics: dict[str, float] = {}
         if self.reflow_enabled:
             print(
                 f"Rectified Flow reflow enabled: mode={self.reflow_mode}, "
@@ -129,7 +135,15 @@ class FPO:
                 f"n_samples_per_obs={self.reflow_n_samples_per_obs}, "
                 f"ema_endpoint={self.reflow_use_ema_endpoint}, "
                 f"theory_metrics={self.theory_metrics_enabled}, "
-                f"adaptive_compute={self.adaptive_compute_enabled}"
+                f"adaptive_compute={self.adaptive_compute_enabled}, "
+                f"random_x0_consistency={self.random_x0_consistency_enabled}"
+            )
+        if self.random_x0_consistency_enabled:
+            print(
+                f"Random-x0 consistency loss enabled: "
+                f"coef={self.random_x0_consistency_coef}, "
+                f"steps={self.random_x0_consistency_steps}, "
+                f"train_flow_x0_mode={getattr(self.policy, 'train_flow_x0_mode', 'random')}"
             )
 
     def init_storage(
@@ -272,6 +286,30 @@ class FPO:
         self.transition.clear()
         self.policy.reset(dones)
 
+    def _reflow_endpoint_actor(self) -> nn.Module | None:
+        """Detached EMA actor for reflow endpoints, or None to use the online actor.
+
+        Before EMA warmup, shadow params are still at initialization — using them as
+        endpoints is harmful, so we fall back to the online actor until warmup ends.
+        """
+        if not self.reflow_use_ema_endpoint or self.ema is None:
+            return None
+        if self.tot_timesteps <= self.ema_warmup_steps:
+            return None
+
+        if not hasattr(self, "_reflow_endpoint_actor_module"):
+            endpoint = copy.deepcopy(self.policy.actor).to(self.device)
+            endpoint.eval()
+            for p in endpoint.parameters():
+                p.requires_grad_(False)
+            self._reflow_endpoint_actor_module = endpoint
+
+        endpoint = self._reflow_endpoint_actor_module
+        for name, param in endpoint.named_parameters():
+            if name in self.ema.shadow_params:
+                param.data.copy_(self.ema.shadow_params[name].to(param.device))
+        return endpoint
+
     def compute_returns(self, last_critic_obs):
         # Shape assertion
         assert (
@@ -296,6 +334,7 @@ class FPO:
         mean_surrogate_loss = 0
         mean_reflow_loss = 0
         mean_adaptive_compute_loss = 0
+        mean_random_x0_consistency_loss = 0
         mean_entropy = 0
         mean_kl = 0
 
@@ -521,22 +560,21 @@ class FPO:
 
             reflow_loss = torch.tensor(0.0, device=self.device)
             if self.reflow_enabled:
-                if self.reflow_use_ema_endpoint and self.ema is not None:
-                    self.ema.store(self.policy.actor)
-                    self.ema.copy_to(self.policy.actor)
-                try:
-                    reflow_loss = self.policy.get_reflow_loss(
-                        obs_batch,
-                        self.reflow_n_samples_per_obs,
-                        advantages=advantages_batch
-                        if self.reflow_mode in {"reward_aware", "fpo_operator"}
-                        else None,
-                        reflow_mode=self.reflow_mode,
-                        advantage_threshold=self.reflow_advantage_threshold,
-                    )
-                finally:
-                    if self.reflow_use_ema_endpoint and self.ema is not None:
-                        self.ema.restore(self.policy.actor)
+                # IMPORTANT: do NOT copy EMA weights onto the training actor.
+                # Endpoints must come from a detached EMA copy; CFM prediction stays
+                # on the online actor. The old store/copy/restore path made both use
+                # EMA weights, so reflow grads were computed under EMA and then applied
+                # after restore — this destabilized fpo_operator (policy collapse).
+                reflow_loss = self.policy.get_reflow_loss(
+                    obs_batch,
+                    self.reflow_n_samples_per_obs,
+                    advantages=advantages_batch
+                    if self.reflow_mode in {"reward_aware", "fpo_operator"}
+                    else None,
+                    reflow_mode=self.reflow_mode,
+                    advantage_threshold=self.reflow_advantage_threshold,
+                    endpoint_actor=self._reflow_endpoint_actor(),
+                )
 
                 if self.theory_metrics_enabled and mini_batch_step == 0:
                     self._last_theory_metrics = self.policy.compute_theory_metrics(
@@ -553,11 +591,22 @@ class FPO:
                     )
                 )
 
+            random_x0_loss = torch.tensor(0.0, device=self.device)
+            if self.random_x0_consistency_enabled:
+                random_x0_loss, self._last_random_x0_metrics = (
+                    self.policy.get_random_x0_consistency_loss(
+                        obs_batch,
+                        step_bins=self.random_x0_consistency_steps,
+                    )
+                )
+
             loss = surrogate_loss + self.value_loss_coef * value_loss
             if self.reflow_enabled:
                 loss = loss + self.reflow_loss_coef * reflow_loss
             if self.adaptive_compute_enabled:
                 loss = loss + self.adaptive_compute_loss_coef * adaptive_loss
+            if self.random_x0_consistency_enabled:
+                loss = loss + self.random_x0_consistency_coef * random_x0_loss
             if entropy_bonus is not None:
                 loss -= self.knn_entropy_coef * entropy_bonus
 
@@ -600,6 +649,8 @@ class FPO:
                 mean_reflow_loss += reflow_loss.item()
             if self.adaptive_compute_enabled:
                 mean_adaptive_compute_loss += adaptive_loss.item()
+            if self.random_x0_consistency_enabled:
+                mean_random_x0_consistency_loss += random_x0_loss.item()
             mean_entropy += entropy_bonus.item() if entropy_bonus is not None else 0.0
 
             mini_batch_step += 1
@@ -612,6 +663,8 @@ class FPO:
             mean_reflow_loss /= num_updates
         if self.adaptive_compute_enabled:
             mean_adaptive_compute_loss /= num_updates
+        if self.random_x0_consistency_enabled:
+            mean_random_x0_consistency_loss /= num_updates
         mean_entropy /= num_updates
         if self.schedule == "adaptive":
             mean_kl /= num_updates
@@ -632,6 +685,11 @@ class FPO:
             loss_dict["adaptive_compute_loss"] = mean_adaptive_compute_loss
             for key, value in self._last_adaptive_metrics.items():
                 loss_dict[key] = value
+        if self.random_x0_consistency_enabled:
+            loss_dict["random_x0_consistency_loss"] = mean_random_x0_consistency_loss
+            for key, value in self._last_random_x0_metrics.items():
+                if key != "random_x0_consistency_loss":
+                    loss_dict[key] = value
         if self.theory_metrics_enabled:
             for key, value in self._last_theory_metrics.items():
                 loss_dict[key] = value

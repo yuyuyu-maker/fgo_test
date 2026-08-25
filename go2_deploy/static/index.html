@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>GO2 Deploy</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body class="mode-sport">
+  <div class="bg"></div>
+  <main class="shell">
+    <header class="top">
+      <div class="brand">
+        <span class="brand-mark">GO2</span>
+        <span class="brand-sub">DEPLOY</span>
+      </div>
+      <div class="status" id="status">
+        <span class="dot" id="dot"></span>
+        <span id="statusText">connecting…</span>
+      </div>
+    </header>
+
+    <section class="mode-panel" id="modePanel" aria-live="polite">
+      <div class="mode-row">
+        <span class="mode-badge" id="modeBadge">SPORT</span>
+        <div class="mode-text">
+          <strong id="modeLabel">内置步态 Sport</strong>
+          <p id="modeBlurb">宇树内置步态（SportClient.Move）。不是 FPO 模型。</p>
+        </div>
+      </div>
+      <dl class="mode-meta" id="modeMeta">
+        <div><dt>backend</dt><dd id="metaBackend">—</dd></div>
+        <div><dt>model</dt><dd id="metaModel">—</dd></div>
+        <div><dt>policy Hz</dt><dd id="metaHz">—</dd></div>
+        <div><dt>UDP</dt><dd id="metaUdp">—</dd></div>
+      </dl>
+      <p class="mode-hint" id="modeHint"></p>
+    </section>
+
+    <section class="readout" aria-live="polite">
+      <div class="metric">
+        <span class="label">vx</span>
+        <span class="value" id="vxVal">0.00</span>
+        <span class="unit">m/s</span>
+      </div>
+      <div class="metric">
+        <span class="label">vy</span>
+        <span class="value" id="vyVal">0.00</span>
+        <span class="unit">m/s</span>
+      </div>
+      <div class="metric">
+        <span class="label">yaw</span>
+        <span class="value" id="yawVal">0.00</span>
+        <span class="unit">rad/s</span>
+      </div>
+    </section>
+
+    <section class="stage">
+      <div class="pad-wrap">
+        <div class="pad" id="pad" aria-label="velocity joystick">
+          <div class="pad-cross"></div>
+          <div class="knob" id="knob"></div>
+        </div>
+        <p class="hint">拖动摇杆 · WASD/QE · 松开全部即暂停（命令清零）· 空格急停</p>
+      </div>
+
+      <aside class="side">
+        <label class="slider-row">
+          <span>max |vx|</span>
+          <input type="range" id="maxVx" min="0.1" max="1.0" step="0.05" value="0.45" />
+          <span id="maxVxLabel">0.45</span>
+        </label>
+        <label class="slider-row">
+          <span>max |vy|</span>
+          <input type="range" id="maxVy" min="0.05" max="0.6" step="0.05" value="0.30" />
+          <span id="maxVyLabel">0.30</span>
+        </label>
+        <label class="slider-row">
+          <span>max |yaw|</span>
+          <input type="range" id="maxYaw" min="0.1" max="1.2" step="0.05" value="0.60" />
+          <span id="maxYawLabel">0.60</span>
+        </label>
+
+        <div class="actions">
+          <button type="button" class="btn danger" id="btnStop">STOP</button>
+          <button type="button" class="btn sport-only" id="btnStandUp">Stand Up</button>
+          <button type="button" class="btn sport-only" id="btnStandDown">Stand Down</button>
+        </div>
+      </aside>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -103,6 +103,17 @@ class FpoRslRlPpoActorCriticCfg:
     Perturbs actions with random noise, which can be interpreted as an entropy
     regularizer."""
 
+    train_flow_x0_mode: Literal["random", "zero", "mix"] = "random"
+    """How to initialize flow noise x0 during on-policy ``act()`` rollouts.
+
+    - ``random``: x0 ~ N(0, I) (default; matches RF training assumption)
+    - ``zero``: x0 = 0 (matches common PostEval ``zero`` mode)
+    - ``mix``: per-env Bernoulli mix of random/zero using ``train_flow_x0_random_prob``
+    """
+
+    train_flow_x0_random_prob: float = 0.5
+    """Probability of sampling random x0 when ``train_flow_x0_mode='mix'``."""
+
     adaptive_compute_enabled: bool = False
     """Enable step predictor head on the actor for state-adaptive compute."""
 
@@ -352,9 +363,24 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     adaptive_step_bins: list[int] = None  # type: ignore[assignment]
     """Discrete integration budgets for the step predictor. Default set in __post_init__."""
 
+    random_x0_consistency_enabled: bool = False
+    """Auxiliary loss: match few-step flow actions to full-step actions under shared random x0.
+
+    Targets PostEval ``random`` robustness (RF assumes x0 ~ N(0,I)) while keeping
+    few-step fidelity. Intended to stack on plain reflow without other idea heads.
+    """
+
+    random_x0_consistency_coef: float = 0.1
+    """Coefficient for ``random_x0_consistency`` when enabled."""
+
+    random_x0_consistency_steps: list[int] = None  # type: ignore[assignment]
+    """Few-step budgets compared against full ``sampling_steps`` under the same x0."""
+
     def __post_init__(self):
         if self.adaptive_step_bins is None:
             self.adaptive_step_bins = [1, 4, 8, 16, 64]
+        if self.random_x0_consistency_steps is None:
+            self.random_x0_consistency_steps = [1, 4, 8]
 
 
 #########################

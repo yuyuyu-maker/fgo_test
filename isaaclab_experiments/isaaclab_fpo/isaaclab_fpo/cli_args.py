@@ -28,13 +28,14 @@ def add_fpo_args(parser: argparse.ArgumentParser):
         choices={
             "baseline",
             "reflow",
+            "reflow_random_x0",
             "reward_aware",
             "adaptive_compute",
             "fpo_operator",
             "theory",
             "all_ideas",
         },
-        help="FPO config variant for Go2 or Spot tasks (overrides default task config when set).",
+        help="FPO config variant for Go2 / Spot / G1 velocity tasks (overrides default task config when set).",
     )
     arg_group.add_argument(
         "--log_project_name", type=str, default=None, help="Name of the logging project when using wandb or neptune."
@@ -42,15 +43,18 @@ def add_fpo_args(parser: argparse.ArgumentParser):
 
 
 def _fpo_variants_for_task(task_name: str):
-    from isaaclab_fpo.task_cfgs import GO2_FPO_VARIANTS, SPOT_FPO_VARIANTS
+    from isaaclab_fpo.task_cfgs import G1_FPO_VARIANTS, GO2_FPO_VARIANTS, SPOT_FPO_VARIANTS
 
     if "Spot" in task_name:
         return SPOT_FPO_VARIANTS
     if "Unitree-Go2" in task_name or "Go2" in task_name:
         return GO2_FPO_VARIANTS
+    # Velocity Flat-G1 only (Tracking-Flat-G1 has no reflow registry).
+    if "G1" in task_name and "Tracking" not in task_name:
+        return G1_FPO_VARIANTS
     raise KeyError(
         f"No FPO variant registry for task '{task_name}'. "
-        "Use a Go2 or Spot velocity task with --fpo_variant."
+        "Use a Go2, Spot, or G1 velocity task with --fpo_variant."
     )
 
 
