@@ -19,7 +19,7 @@ mkdir -p $WORKSPACE_DIR
 
 if [[ ! -f $SENTINEL_FILE ]]; then
   if [[ "$(lsb_release -is)" == "Ubuntu" ]]; then
-    sudo apt install -y build-essential
+    echo "skip apt: build-essential already present"
   fi
 
   # Install miniconda

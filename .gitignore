@@ -1,4 +1,138 @@
-.claude/
+# =============================================================================
+# fgo_test: keep source / docs / scripts; ignore bulky / local / binary artifacts
+# =============================================================================
+
+# --- OS / editor ---
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Python ---
 __pycache__/
-wandb/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.ipynb_checkpoints/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# --- Claude / agent local ---
+.claude/
+
+# --- Experiment outputs (train / eval / sweeps) ---
+**/logs/
+**/outputs/
+**/wandb/
+**/wandb_runs/
+**/runs/
+**/checkpoints/
+**/.hydra/
+**/tb_logs/
+**/tensorboard/
+**/ray_results/
+
+# --- Recorded data / dumps ---
+# Do NOT use **/datasets/ — it matches lerobot/.../datasets/*.py source trees.
+**/data/
+rm75_sim/data/
+**/videos/
+**/recordings/
+*.parquet
+*.h5
+*.hdf5
+*.npz
+*.zarr/
+**/tmp/
+**/tmp_*/
+/tmp/
+
+# --- Model weights / checkpoints ---
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+*.pkl
+*.pickle
+*.bin
+
+# --- Large binary / sim assets (download / generate locally) ---
+*.stl
+*.STL
+*.obj
+*.fbx
+*.usd
+*.usda
+*.usdc
+*.glb
+*.gltf
+*.mp4
+*.avi
+*.mov
+*.webm
+*.wav
+*.mp3
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.pdf
+*.npy
+*.npz.index
+*.npz.data-*
+
+# --- Conda / Isaac runtimes ---
+**/thirdparty/miniconda3/
+**/_isaac_sim/
+**/.env_setup_finish
+**/.env_setup_finished
+*.bak
+
+# IsaacLab: ignore checked-out thirdparty *contents* but keep submodule gitlinks
+# (gitlinks are mode 160000; do not `git rm --cached` those two paths)
+isaaclab_experiments/thirdparty/**
+!isaaclab_experiments/thirdparty/IsaacLab
+!isaaclab_experiments/thirdparty/whole_body_tracking
+
+# WBT reference: keep download script + README, ignore downloaded payloads
+isaaclab_experiments/whole_body_tracking_reference_data/**
+!isaaclab_experiments/whole_body_tracking_reference_data/*.py
+!isaaclab_experiments/whole_body_tracking_reference_data/*.md
+!isaaclab_experiments/whole_body_tracking_reference_data/README.md
+
+# Manipulation: heavy local installs / forks
+manipulation_experiments/thirdparty/miniconda3/
+manipulation_experiments/thirdparty/dexmimicgen/
+manipulation_experiments/far-wandb/
+manipulation_experiments/threading_teaser/
+manipulation_experiments/tmp_tobe_removed/
+
+# RM75: drop recorded packs & official mesh dump (URDF wrapper stays)
+rm75_sim/assets/RM75-6FB/
+rm75_sim/assets/**/*.STL
+rm75_sim/assets/**/*.stl
+
+# --- Misc local noise ---
+nohup.out
+*.log
+*.out
+pids.txt
+**/pids.txt
+**/stamp.txt
+core
+core.*

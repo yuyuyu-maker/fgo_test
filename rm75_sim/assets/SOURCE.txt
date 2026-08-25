@@ -1,0 +1,1 @@
+source: https://github.com/RealManRobot/rm_models/tree/main/RM75/urdf/RM75-6FB

@@ -51,7 +51,7 @@ def test_actor_critic_variants():
     obs = torch.randn(batch, obs_dim)
     adv = torch.randn(batch, 1)
 
-    for name in ("reward_aware", "adaptive_compute", "fpo_operator", "theory"):
+    for name in ("reflow", "reward_aware", "adaptive_compute", "fpo_operator", "theory", "all_ideas"):
         variant = GO2_FPO_VARIANTS[name]()
         cfg = variant.policy
         policy = ActorCritic(obs_dim, critic_dim, act_dim, cfg)

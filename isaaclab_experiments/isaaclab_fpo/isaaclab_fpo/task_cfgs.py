@@ -106,6 +106,31 @@ class UnitreeGo2FlatFlowPPORunnerCfgTheory(UnitreeGo2FlatFlowPPORunnerCfg):
     )
 
 
+@configclass
+class UnitreeGo2FlatFlowPPORunnerCfgAllIdeas(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Stack reward_aware + adaptive_compute + theory (no fpo_operator)."""
+
+    experiment_name = "unitree_go2_reflow_all_ideas"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        adaptive_compute_enabled=True,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="reward_aware",
+        reflow_advantage_threshold=0.0,
+        theory_metrics_enabled=True,
+        adaptive_compute_enabled=True,
+        adaptive_compute_loss_coef=0.1,
+        adaptive_latency_penalty_coef=1.0,
+    )
+
+
 GO2_FPO_VARIANTS = {
     "baseline": UnitreeGo2FlatFlowPPORunnerCfg,
     "reflow": UnitreeGo2FlatFlowPPORunnerCfgReflow,
@@ -113,6 +138,7 @@ GO2_FPO_VARIANTS = {
     "adaptive_compute": UnitreeGo2FlatFlowPPORunnerCfgAdaptiveCompute,
     "fpo_operator": UnitreeGo2FlatFlowPPORunnerCfgFpoOperator,
     "theory": UnitreeGo2FlatFlowPPORunnerCfgTheory,
+    "all_ideas": UnitreeGo2FlatFlowPPORunnerCfgAllIdeas,
 }
 
 @configclass
@@ -131,6 +157,90 @@ class SpotFlatFlowPPORunnerCfg(FpoRslRlOnPolicyRunnerCfg):
         num_learning_epochs=32,
         value_loss_coef=0.5,
     )
+
+
+@configclass
+class SpotFlatFlowPPORunnerCfgRewardAware(SpotFlatFlowPPORunnerCfg):
+    """Spot idea 1: reward-aware rectification on high-advantage samples."""
+
+    experiment_name = "spot_reflow_reward_aware"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        value_loss_coef=0.5,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="reward_aware",
+        reflow_advantage_threshold=0.0,
+    )
+
+
+@configclass
+class SpotFlatFlowPPORunnerCfgAdaptiveCompute(SpotFlatFlowPPORunnerCfg):
+    """Spot idea 2: state-adaptive compute via step predictor."""
+
+    experiment_name = "spot_reflow_adaptive_compute"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        adaptive_compute_enabled=True,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        value_loss_coef=0.5,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        adaptive_compute_enabled=True,
+        adaptive_compute_loss_coef=0.1,
+        adaptive_latency_penalty_coef=1.0,
+    )
+
+
+@configclass
+class SpotFlatFlowPPORunnerCfgFpoOperator(SpotFlatFlowPPORunnerCfg):
+    """Spot idea 3: FPO++-compatible reflow as policy-improvement operator."""
+
+    experiment_name = "spot_reflow_fpo_operator"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        value_loss_coef=0.5,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="fpo_operator",
+        reflow_use_ema_endpoint=True,
+    )
+
+
+@configclass
+class SpotFlatFlowPPORunnerCfgTheory(SpotFlatFlowPPORunnerCfg):
+    """Spot idea 4: theory hooks — log path straightness and discretization gaps."""
+
+    experiment_name = "spot_reflow_theory"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        value_loss_coef=0.5,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        theory_metrics_enabled=True,
+    )
+
+
+SPOT_FPO_VARIANTS = {
+    "baseline": SpotFlatFlowPPORunnerCfg,
+    "reward_aware": SpotFlatFlowPPORunnerCfgRewardAware,
+    "adaptive_compute": SpotFlatFlowPPORunnerCfgAdaptiveCompute,
+    "fpo_operator": SpotFlatFlowPPORunnerCfgFpoOperator,
+    "theory": SpotFlatFlowPPORunnerCfgTheory,
+}
 
 
 # ---------------------------------------------------------------------------

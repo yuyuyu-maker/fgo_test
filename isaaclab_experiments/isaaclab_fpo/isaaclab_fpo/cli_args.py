@@ -32,11 +32,25 @@ def add_fpo_args(parser: argparse.ArgumentParser):
             "adaptive_compute",
             "fpo_operator",
             "theory",
+            "all_ideas",
         },
-        help="Go2 FPO config variant (overrides default task config when set).",
+        help="FPO config variant for Go2 or Spot tasks (overrides default task config when set).",
     )
     arg_group.add_argument(
         "--log_project_name", type=str, default=None, help="Name of the logging project when using wandb or neptune."
+    )
+
+
+def _fpo_variants_for_task(task_name: str):
+    from isaaclab_fpo.task_cfgs import GO2_FPO_VARIANTS, SPOT_FPO_VARIANTS
+
+    if "Spot" in task_name:
+        return SPOT_FPO_VARIANTS
+    if "Unitree-Go2" in task_name or "Go2" in task_name:
+        return GO2_FPO_VARIANTS
+    raise KeyError(
+        f"No FPO variant registry for task '{task_name}'. "
+        "Use a Go2 or Spot velocity task with --fpo_variant."
     )
 
 
@@ -45,15 +59,16 @@ def parse_fpo_cfg(task_name: str, args_cli: argparse.Namespace) -> FpoRslRlOnPol
 
     Looks up the task config from the isaaclab_fpo registry instead of gym kwargs.
     """
-    from isaaclab_fpo.task_cfgs import GO2_FPO_VARIANTS, TASK_CONFIGS
+    from isaaclab_fpo.task_cfgs import TASK_CONFIGS
 
     if hasattr(args_cli, "fpo_variant") and args_cli.fpo_variant is not None:
-        if args_cli.fpo_variant not in GO2_FPO_VARIANTS:
+        variant_registry = _fpo_variants_for_task(task_name)
+        if args_cli.fpo_variant not in variant_registry:
             raise KeyError(
-                f"Unknown fpo_variant '{args_cli.fpo_variant}'. "
-                f"Available: {sorted(GO2_FPO_VARIANTS.keys())}"
+                f"Unknown fpo_variant '{args_cli.fpo_variant}' for task '{task_name}'. "
+                f"Available: {sorted(variant_registry.keys())}"
             )
-        agent_cfg = GO2_FPO_VARIANTS[args_cli.fpo_variant]()
+        agent_cfg = variant_registry[args_cli.fpo_variant]()
     elif task_name not in TASK_CONFIGS:
         raise KeyError(
             f"No FPO config registered for task '{task_name}'. "

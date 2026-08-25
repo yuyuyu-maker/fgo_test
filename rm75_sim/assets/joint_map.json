@@ -1,0 +1,51 @@
+[
+  {
+    "schema_name": "joint_1",
+    "state_name": "joint_1_rad",
+    "pybullet_index": 0,
+    "unit": "rad"
+  },
+  {
+    "schema_name": "joint_2",
+    "state_name": "joint_2_rad",
+    "pybullet_index": 1,
+    "unit": "rad"
+  },
+  {
+    "schema_name": "joint_3",
+    "state_name": "joint_3_rad",
+    "pybullet_index": 2,
+    "unit": "rad"
+  },
+  {
+    "schema_name": "joint_4",
+    "state_name": "joint_4_rad",
+    "pybullet_index": 3,
+    "unit": "rad"
+  },
+  {
+    "schema_name": "joint_5",
+    "state_name": "joint_5_rad",
+    "pybullet_index": 4,
+    "unit": "rad"
+  },
+  {
+    "schema_name": "joint_6",
+    "state_name": "joint_6_rad",
+    "pybullet_index": 5,
+    "unit": "rad"
+  },
+  {
+    "schema_name": "joint_7",
+    "state_name": "joint_7_rad",
+    "pybullet_index": 6,
+    "unit": "rad"
+  },
+  {
+    "schema_name": "gripper",
+    "state_name": "gripper_open",
+    "pybullet_index": 8,
+    "unit": "normalized_open_0_1",
+    "note": "maps prismatic travel / 0.03"
+  }
+]
