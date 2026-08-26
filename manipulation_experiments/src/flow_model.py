@@ -19,6 +19,12 @@ from .flow_net_mlp import FlowMatchingMLPModel
 from .flow_net_unet import FlowMatchingUnetModel
 from .flow_net_residual_mlp import FlowMatchingResidualMLPModel
 from .noise_injection_network import NoiseInjectionNetwork
+from .reflow_extensions import (
+    StepPredictor,
+    compute_advantage_reflow_weights,
+    compute_discretization_gap,
+    compute_path_straightness,
+)
 
 
 # Helper functions for vision encoder
@@ -679,4 +685,269 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             return huber_loss
         else:
             return F.mse_loss(predictions, targets, reduction="none")
+
+    # ------------------------------------------------------------------
+    # Reflow idea variants (ported from isaaclab_fpo)
+    # ------------------------------------------------------------------
+    def ensure_step_predictor(self, step_bins: list[int] | None = None) -> StepPredictor:
+        """Lazily create StepPredictor on observation conditioning dim."""
+        if getattr(self, "step_predictor", None) is None:
+            bins = list(step_bins) if step_bins is not None else [1, 2, 4, 8]
+            self.step_predictor = StepPredictor(
+                num_obs=self.model.global_cond_dim,
+                step_bins=bins,
+            )
+            # Keep device in sync with the flow network.
+            device = next(self.model.parameters()).device
+            self.step_predictor.to(device)
+        return self.step_predictor
+
+    def _expand_batch_for_samples(self, batch: dict[str, Tensor], n_samples: int) -> dict[str, Tensor]:
+        """Repeat observation fields n_samples times along batch dim (no action required)."""
+        if n_samples <= 1:
+            return batch
+        out: dict[str, Tensor] = {}
+        for key, value in batch.items():
+            if key == ACTION:
+                continue
+            if not torch.is_tensor(value):
+                out[key] = value
+                continue
+            # (B, ...) -> (B * n_samples, ...)
+            B = value.shape[0]
+            expanded = value.unsqueeze(1).expand(B, n_samples, *value.shape[1:])
+            out[key] = expanded.reshape(B * n_samples, *value.shape[1:])
+        return out
+
+    def _predict_velocity(
+        self,
+        x_t: Tensor,
+        t_scalar: Tensor,
+        obs_cond: Tensor,
+    ) -> Tensor:
+        """Predict flow velocity at continuous time t for batch of trajectories."""
+        B = x_t.shape[0]
+        # diffusion_step_encoder accepts (B, 1, 1) or (B,) style inputs like CFM path
+        if t_scalar.ndim == 0:
+            t_in = t_scalar.reshape(1).expand(B)
+            timeembedding = self.model.diffusion_step_encoder(t_in)
+        elif t_scalar.ndim == 1:
+            timeembedding = self.model.diffusion_step_encoder(t_scalar)
+        else:
+            timeembedding = self.model.diffusion_step_encoder(t_scalar)
+            timeembedding = timeembedding.reshape(B, -1)
+        if timeembedding.ndim == 1:
+            timeembedding = timeembedding.unsqueeze(0).expand(B, -1)
+        elif timeembedding.shape[0] == 1 and B > 1:
+            timeembedding = timeembedding.expand(B, -1)
+
+        network_output = self.model(x_t, timeembedding, obs_cond)
+        network_output = self.config.mlp_output_scale * network_output
+        if self.config.transported_clip_value is not None:
+            network_output = network_output.clamp(
+                -self.config.transported_clip_value, self.config.transported_clip_value
+            )
+
+        if self.config.flow_network_output_param == "u":
+            return network_output
+        # x0 parameterization: u = (x_t - x0) / t
+        x0_pred = network_output
+        t_for_div = t_scalar
+        while t_for_div.ndim < x_t.ndim:
+            t_for_div = t_for_div.unsqueeze(-1)
+        t_clamped = torch.clamp(t_for_div, min=1e-5)
+        return (x_t - x0_pred) / t_clamped
+
+    def _integrate_flow(
+        self,
+        obs_cond: Tensor,
+        x_t: Tensor,
+        n_steps: int | None = None,
+        use_ema_endpoint: bool = False,
+    ) -> Tensor:
+        """Euler-integrate flow from noise x_t (t=1) to data (t=0) in normalized action space.
+
+        If use_ema_endpoint, temporarily swap in EMA weights for the integration only.
+        Caller should wrap with torch.no_grad() when endpoints must be detached.
+        """
+        used_ema = False
+        if use_ema_endpoint and getattr(self, "ema_model", None) is not None:
+            self.enable_ema()
+            used_ema = True
+        try:
+            flow_steps = int(n_steps) if n_steps is not None else int(self.config.sampling_steps)
+            flow_steps = max(flow_steps, 1)
+            t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=x_t.device)
+            x = x_t
+            for i in range(flow_steps):
+                t_current = t_path[i]
+                t_next = t_path[i + 1]
+                dt = t_next - t_current
+                velocity = self._predict_velocity(x, t_current, obs_cond)
+                x = x + velocity * dt
+            return x
+        finally:
+            if used_ema:
+                self.disable_ema()
+
+    def get_reflow_loss(
+        self,
+        batch: dict[str, Tensor],
+        n_samples_per_obs: int = 4,
+        advantages: Tensor | None = None,
+        reflow_mode: str = "uniform",
+        advantage_threshold: float = 0.0,
+        use_ema_endpoint: bool = False,
+    ) -> Tensor:
+        """Rectified-flow reflow aux loss on straight paths (noise -> flow endpoint).
+
+        Operates in normalized action space, matching ``get_cfm_loss``.
+        """
+        batch = self.normalize_inputs(batch)
+        obs_cond = self.model.encode_observations(batch)
+        B = obs_cond.shape[0]
+        H = self.config.horizon
+        D = self.model.action_dim
+        device = obs_cond.device
+
+        x0 = torch.randn(B, n_samples_per_obs, H, D, device=device)
+        obs_cond_flat = (
+            obs_cond[:, None, :]
+            .expand(B, n_samples_per_obs, -1)
+            .reshape(B * n_samples_per_obs, -1)
+        )
+        x0_flat = x0.reshape(B * n_samples_per_obs, H, D)
+
+        with torch.no_grad():
+            x1_prime = self._integrate_flow(
+                obs_cond_flat,
+                x0_flat,
+                n_steps=self.config.sampling_steps,
+                use_ema_endpoint=use_ema_endpoint,
+            )
+        x1_prime = x1_prime.reshape(B, n_samples_per_obs, H, D)
+
+        t = torch.rand(B, n_samples_per_obs, 1, 1, device=device)
+        x_t = t * x0 + (1.0 - t) * x1_prime
+        target_velocity = x0 - x1_prime
+
+        obs_cond_exp = (
+            obs_cond[:, None, :]
+            .expand(B, n_samples_per_obs, -1)
+            .reshape(B * n_samples_per_obs, -1)
+        )
+        velocity_pred = self._predict_velocity(
+            x_t.reshape(B * n_samples_per_obs, H, D),
+            t.reshape(B * n_samples_per_obs, 1, 1),
+            obs_cond_exp,
+        ).reshape(B, n_samples_per_obs, H, D)
+
+        per_sample_loss = self._compute_squared_error(velocity_pred, target_velocity)
+        # mean over horizon/action dims -> (B, n_samples)
+        per_sample_loss = per_sample_loss.mean(dim=(-1, -2))
+
+        if reflow_mode in {"reward_aware", "fpo_operator"} and advantages is not None:
+            sample_weights = compute_advantage_reflow_weights(
+                advantages, reflow_mode, advantage_threshold
+            )
+            obs_weights = sample_weights[:, None].expand_as(per_sample_loss)
+            return (obs_weights * per_sample_loss).sum() / (obs_weights.sum() + 1e-8)
+        return per_sample_loss.mean()
+
+    def get_adaptive_compute_loss(
+        self,
+        batch: dict[str, Tensor],
+        advantages: Tensor | None = None,
+        latency_penalty_coef: float = 1.0,
+        step_bins: list[int] | None = None,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Train step predictor: match low-step actions to full-step with latency penalty."""
+        bins = list(step_bins) if step_bins is not None else [1, 2, 4, 8]
+        max_steps = int(self.config.sampling_steps)
+        bins = [int(s) for s in bins if 0 < int(s) < max_steps]
+        if not bins:
+            zero = torch.tensor(0.0, device=next(self.model.parameters()).device)
+            return zero, {}
+
+        predictor = self.ensure_step_predictor(bins)
+        batch = self.normalize_inputs(batch)
+        obs_cond = self.model.encode_observations(batch)
+        B = obs_cond.shape[0]
+        H = self.config.horizon
+        D = self.model.action_dim
+        device = obs_cond.device
+
+        x0 = torch.zeros(B, H, D, device=device)
+        with torch.no_grad():
+            action_full = self._integrate_flow(obs_cond, x0, n_steps=max_steps)
+
+        pred_steps = predictor.predict_steps(obs_cond)
+        action_low = torch.zeros_like(action_full)
+        for steps in bins:
+            mask = pred_steps == steps
+            if not mask.any():
+                continue
+            action_low[mask] = self._integrate_flow(
+                obs_cond[mask], x0[mask], n_steps=int(steps)
+            )
+
+        fidelity_loss = (action_low - action_full).pow(2).mean()
+        latency_penalty = predictor.expected_step_fraction(obs_cond).mean()
+        adv_bonus = torch.tensor(0.0, device=device)
+        if advantages is not None:
+            adv_bonus = torch.clamp(advantages.reshape(-1), min=0.0).mean()
+
+        loss = fidelity_loss + latency_penalty_coef * latency_penalty - 0.1 * adv_bonus
+        metrics = {
+            "adaptive_fidelity_loss": float(fidelity_loss.item()),
+            "adaptive_latency_penalty": float(latency_penalty.item()),
+            "adaptive_mean_steps": float(pred_steps.float().mean().item()),
+        }
+        return loss, metrics
+
+    @torch.no_grad()
+    def compute_theory_metrics(
+        self,
+        batch: dict[str, Tensor],
+        n_samples_per_obs: int = 1,
+    ) -> dict[str, float]:
+        """Theory hooks: path straightness and discretization gap proxies."""
+        batch = self.normalize_inputs(batch)
+        obs_cond = self.model.encode_observations(batch)
+        B = obs_cond.shape[0]
+        H = self.config.horizon
+        D = self.model.action_dim
+        device = obs_cond.device
+        max_steps = int(self.config.sampling_steps)
+
+        x0 = torch.zeros(B, n_samples_per_obs, H, D, device=device)
+        obs_flat = (
+            obs_cond[:, None, :]
+            .expand(B, n_samples_per_obs, -1)
+            .reshape(B * n_samples_per_obs, -1)
+        )
+        x0_flat = x0.reshape(B * n_samples_per_obs, H, D)
+        x1 = self._integrate_flow(obs_flat, x0_flat, n_steps=max_steps)
+        x1 = x1.reshape(B, n_samples_per_obs, H, D)
+
+        t_mid = torch.full((B, n_samples_per_obs, 1, 1), 0.5, device=device)
+        x_t = t_mid * x0 + (1.0 - t_mid) * x1
+        target_velocity = x0 - x1
+        velocity_pred = self._predict_velocity(
+            x_t.reshape(B * n_samples_per_obs, H, D),
+            t_mid.reshape(B * n_samples_per_obs, 1, 1),
+            obs_flat,
+        ).reshape(B, n_samples_per_obs, H, D)
+
+        straightness = compute_path_straightness(x0, x1, velocity_pred).mean().item()
+        metrics = {"path_straightness": float(straightness)}
+        for low_steps in (1, 2, 4, 8):
+            if low_steps >= max_steps:
+                continue
+            x1_low = self._integrate_flow(obs_flat, x0_flat, n_steps=low_steps)
+            x1_low = x1_low.reshape(B, n_samples_per_obs, H, D)
+            gap = compute_discretization_gap(x1, x1_low).mean().item()
+            metrics[f"discretization_gap_{low_steps}"] = float(gap)
+        return metrics
+
 

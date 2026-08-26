@@ -156,6 +156,21 @@ class FlowPPOConfig:
     experiment: str = "finetune_fpo"
 
     # Run
+
+    # Reflow idea variants (ported from isaaclab_fpo)
+    fpo_variant: Literal["none", "reflow", "reward_aware", "adaptive_compute", "fpo_operator", "theory"] = "none"
+    reflow_enabled: bool = False
+    reflow_loss_coef: float = 1.0
+    reflow_n_samples_per_obs: int = 4
+    reflow_mode: Literal["uniform", "reward_aware", "fpo_operator"] = "uniform"
+    reflow_advantage_threshold: float = 0.0
+    reflow_use_ema_endpoint: bool = False
+    adaptive_compute_enabled: bool = False
+    adaptive_compute_loss_coef: float = 0.1
+    adaptive_latency_penalty_coef: float = 1.0
+    adaptive_step_bins: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    theory_metrics_enabled: bool = False
+
     output_dir: Optional[str] = None
 
 
@@ -555,7 +570,33 @@ def download_checkpoint_from_wandb_rank0(
 
 
 # ---- Main --------------------------------------------------------------------
+def apply_fpo_variant(cfg: "FlowPPOConfig") -> "FlowPPOConfig":
+    """Map --fpo_variant to reflow/adaptive/theory flags (isaaclab_fpo-compatible)."""
+    variant = cfg.fpo_variant
+    if variant == "none":
+        return cfg
+    # All idea variants enable base reflow.
+    cfg.reflow_enabled = True
+    if variant == "reflow":
+        cfg.reflow_mode = "uniform"
+    elif variant == "reward_aware":
+        cfg.reflow_mode = "reward_aware"
+    elif variant == "fpo_operator":
+        cfg.reflow_mode = "fpo_operator"
+        cfg.reflow_use_ema_endpoint = True
+    elif variant == "adaptive_compute":
+        cfg.reflow_mode = "uniform"
+        cfg.adaptive_compute_enabled = True
+    elif variant == "theory":
+        cfg.reflow_mode = "uniform"
+        cfg.theory_metrics_enabled = True
+    else:
+        raise ValueError(f"Unknown fpo_variant: {variant}")
+    return cfg
+
+
 def main(cfg: FlowPPOConfig):
+    cfg = apply_fpo_variant(cfg)
     # In case you train a policy from scratch with rewards
     # Normalize image_observation_keys -> list[str] (or None)
     cfg.image_observation_keys = (
@@ -849,6 +890,10 @@ def main(cfg: FlowPPOConfig):
                 f"Image keys: {image_keys} | Image shape: ({img_c},{img_h},{img_w}) | n_images={n_images}")
 
     # ----------------- Optimizers / sched ----------------
+    if cfg.adaptive_compute_enabled:
+        actor_module.ensure_step_predictor(cfg.adaptive_step_bins)
+        logger.info(f"[Rank {rank}] Initialized StepPredictor bins={cfg.adaptive_step_bins}")
+
     params_actor = actor.parameters()
     optimizer_actor = optim.AdamW(
         params_actor,
@@ -925,6 +970,8 @@ def main(cfg: FlowPPOConfig):
     }
 
     def get_cfm_values(actor, obs, n_action_samples=1, cfm_loss_ts=None, cfm_loss_epsilons=None, debug=False):
+        # forward_fpo expands obs/actions in-place when n_action_samples>1; never mutate the caller's batch
+        obs = copy.deepcopy(obs)
         cfm_loss, cfm_loss_t, cfm_loss_eps = actor(
             obs, n_action_samples, cfm_loss_ts, cfm_loss_epsilons, debug=debug
         )
@@ -1066,6 +1113,7 @@ def main(cfg: FlowPPOConfig):
             successes_global, episodes_global = t.tolist()
             success_rate_global = (successes_global / episodes_global) if episodes_global > 0 else 0.0
         else:
+            episodes_global = float(done_episodes)
             success_rate_global = success_rate_local
 
         if rank == 0:
@@ -1337,6 +1385,41 @@ def main(cfg: FlowPPOConfig):
                 entropy_loss = -entropy.mean() if cfg.learn_sde_sigma and isinstance(entropy, torch.Tensor) else 0.0
                 policy_loss = pg_loss + cfg.entropy_loss_coef * entropy_loss if iteration > cfg.n_iterations_train_only_value else 0.0
                 loss = (policy_loss + v_loss * cfg.vf_coef) / cfg.gradient_accumulation_steps
+
+                reflow_loss_val = 0.0
+                adaptive_loss_val = 0.0
+                adaptive_metrics = {}
+                theory_metrics = {}
+                if iteration > cfg.n_iterations_train_only_value and cfg.loss_mode == "fpo":
+                    reflow_batch = {k: mb_obs_images[k][:, 0] for k in mb_obs_images.keys()}
+                    reflow_batch["observation.state"] = mb_obs_state[:, 0]
+                    reflow_adv = mb_advantages[:, 0:1] if mb_advantages.ndim > 1 else mb_advantages
+
+                    if cfg.reflow_enabled:
+                        reflow_loss = actor_module.get_reflow_loss(
+                            reflow_batch,
+                            n_samples_per_obs=cfg.reflow_n_samples_per_obs,
+                            advantages=reflow_adv if cfg.reflow_mode in {"reward_aware", "fpo_operator"} else None,
+                            reflow_mode=cfg.reflow_mode,
+                            advantage_threshold=cfg.reflow_advantage_threshold,
+                            use_ema_endpoint=cfg.reflow_use_ema_endpoint,
+                        )
+                        loss = loss + (cfg.reflow_loss_coef * reflow_loss) / cfg.gradient_accumulation_steps
+                        reflow_loss_val = float(reflow_loss.detach().item())
+
+                    if cfg.adaptive_compute_enabled:
+                        adaptive_loss, adaptive_metrics = actor_module.get_adaptive_compute_loss(
+                            reflow_batch,
+                            advantages=reflow_adv,
+                            latency_penalty_coef=cfg.adaptive_latency_penalty_coef,
+                            step_bins=cfg.adaptive_step_bins,
+                        )
+                        loss = loss + (cfg.adaptive_compute_loss_coef * adaptive_loss) / cfg.gradient_accumulation_steps
+                        adaptive_loss_val = float(adaptive_loss.detach().item())
+
+                    if cfg.theory_metrics_enabled and start == 0:
+                        theory_metrics = actor_module.compute_theory_metrics(reflow_batch)
+
                 loss.backward()
                 accumulation_counter += 1
 
@@ -1461,6 +1544,15 @@ def main(cfg: FlowPPOConfig):
                 }
                 # Add CFM/DPPO specific metrics
                 log_dict.update(cfm_metrics)
+                if cfg.reflow_enabled:
+                    log_dict["losses/reflow_loss"] = float(reflow_loss_val)
+                if cfg.adaptive_compute_enabled:
+                    log_dict["losses/adaptive_compute_loss"] = float(adaptive_loss_val)
+                    for ak, av in adaptive_metrics.items():
+                        log_dict[f"adaptive/{ak}"] = float(av)
+                if cfg.theory_metrics_enabled:
+                    for tk, tv in theory_metrics.items():
+                        log_dict[f"theory/{tk}"] = float(tv)
                 wandb.log(log_dict, step=global_step)
 
         # Step schedulers

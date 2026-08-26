@@ -2,7 +2,9 @@ SOURCE_ENV_SETUP_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null
 if [ -n "$ZSH_VERSION" ]; then
     SOURCE_ENV_SETUP_DIR="$( cd "$( dirname "$0" )" && pwd )"
 fi
-source ${SOURCE_ENV_SETUP_DIR}/thirdparty/miniconda3/bin/activate isaaclab_fpo
+# Must match setup_env.sh: conda lives on local disk, not /workspace (bosfs).
+CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3_isaaclab_fpo}
+source ${CONDA_ROOT}/bin/activate isaaclab_fpo
 
 # # Environment variable hacks: these are only needed when installing IsaacSim without pip, from the release zip.
 # # Set PYTHONPATH env variable within the conda environment.
@@ -12,9 +14,9 @@ source ${SOURCE_ENV_SETUP_DIR}/thirdparty/miniconda3/bin/activate isaaclab_fpo
 # export PYTHONPATH=$BACKUP_PYTHONPATH
 # # Need to deactivate => reactivate for the variable to take effect.
 # conda deactivate
-# source ${SOURCE_ENV_SETUP_DIR}/thirdparty/miniconda3/bin/activate isaaclab_fpo
+# source ${CONDA_ROOT}/bin/activate isaaclab_fpo
 
-export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${SOURCE_ENV_SETUP_DIR}/thirdparty/miniconda3/envs/isaaclab_fpo/lib
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${CONDA_ROOT}/envs/isaaclab_fpo/lib
 export OMNI_KIT_ACCEPT_EULA=YES
 
 # Workaround: newer NVIDIA open kernel modules (driver 580+, kernel 6.17+) may

@@ -3,17 +3,23 @@ set -ex
 
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
-# Initialize git submodules (IsaacLab)
-# Skip if not in a git repo (e.g., SkyPilot workdir sync strips .git)
-if git rev-parse --git-dir > /dev/null 2>&1; then
-  git submodule update --init --recursive
+# Initialize git submodules (IsaacLab) only if missing.
+# Skip when already vendored (bosfs/git-submodule clone often fails here).
+if [[ ! -f "$SCRIPT_DIR/thirdparty/IsaacLab/isaaclab.sh" ]]; then
+  if git rev-parse --git-dir > /dev/null 2>&1; then
+    git submodule update --init --recursive
+  fi
 fi
 
 # Create overall workspace
 WORKSPACE_DIR=$SCRIPT_DIR/thirdparty
-CONDA_ROOT=$WORKSPACE_DIR/miniconda3
+# /workspace is bosfs and cannot execute binaries; keep conda on local disk.
+CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3_isaaclab_fpo}
 ENV_ROOT=$CONDA_ROOT/envs/isaaclab_fpo
 SENTINEL_FILE=.env_setup_finished
+export PIP_CACHE_DIR=${PIP_CACHE_DIR:-/workspace/.cache/pip}
+export TMPDIR=${TMPDIR:-/workspace/tmp}
+mkdir -p "$PIP_CACHE_DIR" "$TMPDIR"
 
 mkdir -p $WORKSPACE_DIR
 
@@ -34,8 +40,8 @@ if [[ ! -f $SENTINEL_FILE ]]; then
   if [[ ! -d $ENV_ROOT ]]; then
     $CONDA_ROOT/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
     $CONDA_ROOT/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-    $CONDA_ROOT/bin/conda install -y mamba -c conda-forge -n base
-    MAMBA_ROOT_PREFIX=$CONDA_ROOT $CONDA_ROOT/bin/mamba create -y -n isaaclab_fpo python=3.10
+    # Prefer conda create; mamba on newest miniconda can hit python pin conflicts.
+    $CONDA_ROOT/bin/conda create -y -n isaaclab_fpo python=3.10
   fi
 
   source $CONDA_ROOT/bin/activate isaaclab_fpo

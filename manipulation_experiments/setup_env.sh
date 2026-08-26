@@ -5,7 +5,8 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 
 # Create overall workspace
 WORKSPACE_DIR=$SCRIPT_DIR/thirdparty
-CONDA_ROOT=$WORKSPACE_DIR/miniconda3
+# /workspace is bosfs and cannot execute binaries (no +x). Install conda on local disk.
+CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3_fpo_manipulation}
 ENV_ROOT=$CONDA_ROOT/envs/fpo_manipulation
 SENTINEL_FILE=.env_setup_finish
 
@@ -41,16 +42,24 @@ if [[ ! -f $SENTINEL_FILE ]]; then
   # Weird... it's causing the error in the server by referencing the base environment
   # python $WORKSPACE_DIR/robosuite/robosuite/scripts/setup_macros.py # avoid the warning
 
-  # Git clone dexmimicgen into WORKSPACE_DIR/dexmimicgen if not already present
+  # Git clone dexmimicgen. bosfs (/workspace) breaks git pack files, so clone on
+  # local disk first, then copy the tree (without .git) into thirdparty.
   # Note: git archive creates an empty dir for gitlink submodules, so check for
   # setup.py inside rather than just the directory's existence.
+  DEXMG_LOCAL=${DEXMG_LOCAL:-$HOME/src/dexmimicgen}
   if [ ! -f $WORKSPACE_DIR/dexmimicgen/setup.py ]; then
     rm -rf $WORKSPACE_DIR/dexmimicgen
-    git clone https://github.com/NVlabs/dexmimicgen.git $WORKSPACE_DIR/dexmimicgen
+    if [ ! -f $DEXMG_LOCAL/setup.py ]; then
+      rm -rf $DEXMG_LOCAL
+      mkdir -p "$(dirname "$DEXMG_LOCAL")"
+      git clone https://github.com/NVlabs/dexmimicgen.git $DEXMG_LOCAL
+    fi
+    mkdir -p $WORKSPACE_DIR/dexmimicgen
+    tar -C $DEXMG_LOCAL --exclude='.git' -cf - . | tar -C $WORKSPACE_DIR/dexmimicgen -xf -
   fi
 
-  # Install dexmimicgen
-  python -m pip install -e $WORKSPACE_DIR/dexmimicgen
+  # Install dexmimicgen from local clone (editable needs a real local path)
+  python -m pip install -e $DEXMG_LOCAL
 
   # Install PyOpenGL-accelerate
   python -m pip install PyOpenGL-accelerate
