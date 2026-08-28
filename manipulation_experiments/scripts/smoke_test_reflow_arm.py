@@ -121,11 +121,22 @@ def test_policy_losses_if_available() -> None:
     assert torch.isfinite(adaptive_loss)
     theory = policy.compute_theory_metrics(batch)
     assert "path_straightness" in theory
+
+    policy.attach_frozen_teacher()
+    kd_loss, kd_metrics = policy.get_teacher_kd_loss(
+        batch, step_bins=[1, 2], zero_x0_prob=0.25
+    )
+    assert torch.isfinite(kd_loss) and "teacher_kd_loss" in kd_metrics
+    loss_teacher_ep = policy.get_reflow_loss(
+        batch, n_samples_per_obs=2, reflow_mode="uniform", zero_x0_prob=0.25
+    )
+    assert torch.isfinite(loss_teacher_ep)
     print(
         "policy losses OK",
         float(loss_u),
         float(adaptive_loss),
         theory.get("path_straightness"),
+        float(kd_loss),
         metrics,
     )
 

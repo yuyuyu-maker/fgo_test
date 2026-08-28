@@ -2,8 +2,8 @@ SOURCE_ENV_SETUP_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null
 if [ -n "$ZSH_VERSION" ]; then
     SOURCE_ENV_SETUP_DIR="$( cd "$( dirname "$0" )" && pwd )"
 fi
-# Must match setup_env.sh: conda lives on local disk, not /workspace (bosfs).
-CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3_isaaclab_fpo}
+# Must match setup_env.sh CONDA_ROOT.
+CONDA_ROOT=${CONDA_ROOT:-/tmp/isaaclab_conda/miniconda3_isaaclab_fpo}
 source ${CONDA_ROOT}/bin/activate isaaclab_fpo
 
 # # Environment variable hacks: these are only needed when installing IsaacSim without pip, from the release zip.

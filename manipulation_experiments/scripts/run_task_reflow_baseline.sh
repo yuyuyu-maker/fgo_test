@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run 5 reflow-idea FPO++ variants sequentially for ONE task.
+# Run FPO++ variants sequentially for ONE task.
+# Core set: baseline, reflow, all_ideas_teacher_kd.
 # Training hyperparameters match scripts/run_main_benchmark.sh (FPO++ section).
 #
 # Usage:
@@ -29,6 +30,10 @@ SAVE_EVAL_VIDEO="${SAVE_EVAL_VIDEO:-0}"
 START_VARIANT="${START_VARIANT:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 RESUME_CKPT="${RESUME_CKPT:-}"
+NUM_ENVS="${NUM_ENVS:-30}"
+EVAL_NUM_EPISODES="${EVAL_NUM_EPISODES:-40}"
+ROLLOUT_FREQ="${ROLLOUT_FREQ:-10}"
+SAVE_FREQ="${SAVE_FREQ:-10}"
 TASK_SLUG="$(echo "$TASK" | tr '[:upper:]' '[:lower:]')"
 
 if [[ ! -f "${CKPT_DIR}/policy/model.safetensors" ]]; then
@@ -109,9 +114,9 @@ COMMON=(
   --gradient_accumulation_steps 1
   --num_minibatches 8
   --log_freq 1
-  --save_freq 2
-  --rollout_freq 2
-  --eval_num_episodes 200
+  --save_freq "${SAVE_FREQ}"
+  --rollout_freq "${ROLLOUT_FREQ}"
+  --eval_num_episodes "${EVAL_NUM_EPISODES}"
   --data_collection_steps 1600
   --do_chunk_level_ppo True
   --eval_ema False
@@ -120,7 +125,7 @@ COMMON=(
   --gae_lambda 0.99
   --n_action_samples 8
   --n_action_steps 16
-  --num_envs 30
+  --num_envs "${NUM_ENVS}"
   --sampling_steps 10
   --spo_clip_coef 0.01
   --zero_sampling True
@@ -143,11 +148,18 @@ COMMON=(
   --save_eval_video "${SAVE_EVAL_VIDEO}"
 )
 
-VARIANTS=(reflow reward_aware adaptive_compute fpo_operator theory)
+if [[ -n "${VARIANTS:-}" ]]; then
+  # shellcheck disable=SC2206
+  VARIANTS=($VARIANTS)
+else
+  VARIANTS=(baseline reflow all_ideas_teacher_kd)
+fi
 LOG_DIR="${ROOT}/logs/reflow_baseline_${TASK_SLUG}_gpu${GPU}_${STAMP}"
 mkdir -p "$LOG_DIR"
 echo "stamp=${STAMP}" > "${LOG_DIR}/stamp.txt"
 echo "task=${TASK} gpu=${GPU} ckpt=${CKPT_DIR}" >> "${LOG_DIR}/stamp.txt"
+echo "variants=${VARIANTS[*]}" >> "${LOG_DIR}/stamp.txt"
+echo "num_envs=${NUM_ENVS} eval_num_episodes=${EVAL_NUM_EPISODES} rollout_freq=${ROLLOUT_FREQ} save_freq=${SAVE_FREQ}" >> "${LOG_DIR}/stamp.txt"
 
 started=false
 if [[ -z "$START_VARIANT" ]]; then
@@ -194,14 +206,20 @@ for variant in "${VARIANTS[@]}"; do
     fi
   fi
 
-  if [[ "$latest_step" -ge "$TOTAL_TIMESTEPS" && "$latest_step" -gt 0 ]]; then
-    echo "[$(date '+%F %T')] SKIP ${variant}: already at step_${latest_step} (>= ${TOTAL_TIMESTEPS})"
+  skip_at=$(( TOTAL_TIMESTEPS * 99 / 100 ))
+  if [[ "$latest_step" -ge "$skip_at" && "$latest_step" -gt 0 ]]; then
+    echo "[$(date '+%F %T')] SKIP ${variant}: already at step_${latest_step} (>= ${skip_at})"
     continue
+  fi
+
+  extra_args=()
+  if [[ "$variant" == "reflow_teacher_kd" || "$variant" == "all_ideas_teacher_kd" ]]; then
+    extra_args+=(--reflow_teacher_checkpoint "${TEACHER_CKPT:-$CKPT_DIR}")
   fi
 
   echo "[$(date '+%F %T')] GPU${GPU} ${TASK}/${variant} (baseline FPO++) -> ${log_file}"
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo "  DRY_RUN: CUDA_VISIBLE_DEVICES=${GPU} ${COMMON[*]} --fpo_variant ${variant} --output_dir ${out_dir} ${resume_args[*]}"
+    echo "  DRY_RUN: CUDA_VISIBLE_DEVICES=${GPU} ${COMMON[*]} --fpo_variant ${variant} --output_dir ${out_dir} ${resume_args[*]} ${extra_args[*]}"
     continue
   fi
   CUDA_VISIBLE_DEVICES="${GPU}" MUJOCO_EGL_DEVICE_ID="${GPU}" \
@@ -210,8 +228,9 @@ for variant in "${VARIANTS[@]}"; do
       --experiment "finetune-fpo++-${TASK_SLUG}-${variant}" \
       --output_dir "${out_dir}" \
       "${resume_args[@]}" \
+      "${extra_args[@]}" \
       >> "${log_file}" 2>&1
   echo "[$(date '+%F %T')] Finished ${TASK}/${variant}"
 done
 
-echo "[$(date '+%F %T')] All 5 variants done for ${TASK}. stamp=${STAMP}"
+echo "[$(date '+%F %T')] All variants done for ${TASK}: ${VARIANTS[*]}. stamp=${STAMP}"

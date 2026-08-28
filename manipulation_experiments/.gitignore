@@ -29,3 +29,8 @@ threading_teaser/
 .env.*
 
 tmp_tobe_removed/
+
+# Local BC checkpoints and Google-Drive zips
+downloaded_checkpoints/
+*.zip
+*.larkcache

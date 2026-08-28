@@ -162,7 +162,17 @@ class FlowPPOConfig:
     # Run
 
     # Reflow idea variants (ported from isaaclab_fpo)
-    fpo_variant: Literal["none", "reflow", "reward_aware", "adaptive_compute", "fpo_operator", "theory"] = "none"
+    fpo_variant: Literal[
+        "none",
+        "baseline",
+        "reflow",
+        "reward_aware",
+        "adaptive_compute",
+        "fpo_operator",
+        "theory",
+        "reflow_teacher_kd",
+        "all_ideas_teacher_kd",
+    ] = "none"
     reflow_enabled: bool = False
     reflow_loss_coef: float = 1.0
     reflow_n_samples_per_obs: int = 4
@@ -175,6 +185,11 @@ class FlowPPOConfig:
     adaptive_latency_penalty_coef: float = 1.0
     adaptive_step_bins: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
     theory_metrics_enabled: bool = False
+    reflow_teacher_checkpoint: Optional[str] = None
+    teacher_kd_enabled: bool = False
+    teacher_kd_coef: float = 0.1
+    teacher_kd_steps: list[int] = field(default_factory=lambda: [1, 4, 8])
+    teacher_aux_zero_x0_prob: float = 0.25
 
     output_dir: Optional[str] = None
 
@@ -587,7 +602,8 @@ def download_checkpoint_from_wandb_rank0(
 def apply_fpo_variant(cfg: "FlowPPOConfig") -> "FlowPPOConfig":
     """Map --fpo_variant to reflow/adaptive/theory flags (isaaclab_fpo-compatible)."""
     variant = cfg.fpo_variant
-    if variant == "none":
+    if variant in ("none", "baseline"):
+        cfg.reflow_enabled = False
         return cfg
     # All idea variants enable base reflow.
     cfg.reflow_enabled = True
@@ -604,6 +620,16 @@ def apply_fpo_variant(cfg: "FlowPPOConfig") -> "FlowPPOConfig":
     elif variant == "theory":
         cfg.reflow_mode = "uniform"
         cfg.theory_metrics_enabled = True
+    elif variant == "reflow_teacher_kd":
+        cfg.reflow_mode = "uniform"
+        cfg.teacher_kd_enabled = True
+        cfg.reflow_use_ema_endpoint = False
+    elif variant == "all_ideas_teacher_kd":
+        cfg.reflow_mode = "reward_aware"
+        cfg.teacher_kd_enabled = True
+        cfg.adaptive_compute_enabled = True
+        cfg.theory_metrics_enabled = True
+        cfg.reflow_use_ema_endpoint = False
     else:
         raise ValueError(f"Unknown fpo_variant: {variant}")
     return cfg
@@ -854,6 +880,39 @@ def main(cfg: FlowPPOConfig):
     logger.info(f"[Rank {rank}] N action steps: {actor_module.config.n_action_steps}, "
                 f"prediction horizon: {actor_module.config.horizon}")
     logger.info(f"[Rank {rank}] Critic: {critic}")
+
+    if cfg.teacher_kd_enabled or cfg.reflow_teacher_checkpoint:
+        teacher_sd = None
+        teacher_path = cfg.reflow_teacher_checkpoint or cfg.base_policy_local_path
+        if teacher_path:
+            tdir = Path(teacher_path)
+            weights = tdir / "policy" / "model.safetensors"
+            if not weights.exists():
+                weights = tdir / "model.safetensors"
+            if weights.exists():
+                teacher_sd = load_file(str(weights), device="cpu")
+                logger.info(
+                    colored(
+                        f"[Rank {rank}] Loading frozen teacher from {weights}",
+                        "cyan",
+                    )
+                )
+            else:
+                logger.warning(
+                    f"[Rank {rank}] reflow_teacher_checkpoint has no model.safetensors "
+                    f"({teacher_path}); copying online actor as teacher"
+                )
+        actor_module.attach_frozen_teacher(teacher_sd)
+        if cfg.teacher_kd_enabled and actor_module.__dict__.get("_teacher_model") is None:
+            raise RuntimeError("teacher_kd_enabled requires a frozen teacher")
+        logger.info(
+            colored(
+                f"[Rank {rank}] Frozen teacher attached "
+                f"(kd={cfg.teacher_kd_enabled}, kd_steps={cfg.teacher_kd_steps}, "
+                f"aux_zero_x0_prob={cfg.teacher_aux_zero_x0_prob})",
+                "green",
+            )
+        )
 
 
     # ----------------- Environment setup -----------------
@@ -1428,12 +1487,19 @@ def main(cfg: FlowPPOConfig):
 
                 reflow_loss_val = 0.0
                 adaptive_loss_val = 0.0
+                teacher_kd_loss_val = 0.0
                 adaptive_metrics = {}
+                teacher_kd_metrics = {}
                 theory_metrics = {}
                 if iteration > cfg.n_iterations_train_only_value and cfg.loss_mode == "fpo":
                     reflow_batch = {k: mb_obs_images[k][:, 0] for k in mb_obs_images.keys()}
                     reflow_batch["observation.state"] = mb_obs_state[:, 0]
                     reflow_adv = mb_advantages[:, 0:1] if mb_advantages.ndim > 1 else mb_advantages
+                    teacher_zero_x0 = (
+                        cfg.teacher_aux_zero_x0_prob
+                        if actor_module.__dict__.get("_teacher_model") is not None
+                        else 0.0
+                    )
 
                     if cfg.reflow_enabled:
                         reflow_loss = actor_module.get_reflow_loss(
@@ -1444,6 +1510,7 @@ def main(cfg: FlowPPOConfig):
                             advantage_threshold=cfg.reflow_advantage_threshold,
                             use_ema_endpoint=cfg.reflow_use_ema_endpoint,
                             ema_warmup_updates=cfg.reflow_ema_warmup_updates,
+                            zero_x0_prob=teacher_zero_x0,
                         )
                         loss = loss + (cfg.reflow_loss_coef * reflow_loss) / cfg.gradient_accumulation_steps
                         reflow_loss_val = float(reflow_loss.detach().item())
@@ -1457,6 +1524,15 @@ def main(cfg: FlowPPOConfig):
                         )
                         loss = loss + (cfg.adaptive_compute_loss_coef * adaptive_loss) / cfg.gradient_accumulation_steps
                         adaptive_loss_val = float(adaptive_loss.detach().item())
+
+                    if cfg.teacher_kd_enabled:
+                        teacher_kd_loss, teacher_kd_metrics = actor_module.get_teacher_kd_loss(
+                            reflow_batch,
+                            step_bins=cfg.teacher_kd_steps,
+                            zero_x0_prob=cfg.teacher_aux_zero_x0_prob,
+                        )
+                        loss = loss + (cfg.teacher_kd_coef * teacher_kd_loss) / cfg.gradient_accumulation_steps
+                        teacher_kd_loss_val = float(teacher_kd_loss.detach().item())
 
                     if cfg.theory_metrics_enabled and start == 0:
                         theory_metrics = actor_module.compute_theory_metrics(reflow_batch)
@@ -1591,6 +1667,11 @@ def main(cfg: FlowPPOConfig):
                     log_dict["losses/adaptive_compute_loss"] = float(adaptive_loss_val)
                     for ak, av in adaptive_metrics.items():
                         log_dict[f"adaptive/{ak}"] = float(av)
+                if cfg.teacher_kd_enabled:
+                    log_dict["losses/teacher_kd_loss"] = float(teacher_kd_loss_val)
+                    for kk, kv in teacher_kd_metrics.items():
+                        if kk != "teacher_kd_loss":
+                            log_dict[f"teacher_kd/{kk}"] = float(kv)
                 if cfg.theory_metrics_enabled:
                     for tk, tv in theory_metrics.items():
                         log_dict[f"theory/{tk}"] = float(tv)

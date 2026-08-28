@@ -142,3 +142,8 @@ pids.txt
 **/stamp.txt
 core
 core.*
+
+# --- Archives / FUSE cache / local BC weights (download, do not commit) ---
+*.zip
+*.larkcache
+manipulation_experiments/downloaded_checkpoints/

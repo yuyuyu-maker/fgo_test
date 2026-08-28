@@ -123,6 +123,8 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         # Detached flow copy for fpo_operator reflow endpoints (never swap training weights).
         self._reflow_endpoint_model = None
         self._ema_update_count = 0
+        # Frozen teacher flow net (not registered as a submodule, so checkpoints stay student-only).
+        self.__dict__["_teacher_model"] = None
 
         # Exploration noise value (can be set dynamically)
         self.exploration_noise_std = config.exploration_noise_std  
@@ -743,12 +745,38 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         for param, shadow in zip(endpoint.parameters(), self.ema_model.shadow_params):
             param.data.copy_(shadow.to(param.device))
 
+    def attach_frozen_teacher(self, source_state_dict: dict | None = None) -> None:
+        """Freeze a deepcopy of the flow net as teacher for reflow endpoints / KD.
+
+        ``source_state_dict`` may be a full ``FlowMatchingPolicy`` state (keys
+        prefixed with ``model.``) or a raw flow-net state. If omitted, the current
+        online net is copied (typically the BC / baseline weights at init).
+        """
+        teacher = copy.deepcopy(self.model)
+        if source_state_dict is not None:
+            model_sd = {
+                key[len("model.") :]: value
+                for key, value in source_state_dict.items()
+                if key.startswith("model.")
+            }
+            if model_sd:
+                teacher.load_state_dict(model_sd, strict=False)
+            else:
+                teacher.load_state_dict(source_state_dict, strict=False)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad_(False)
+        self.__dict__["_teacher_model"] = teacher
+
     def _reflow_integration_model(
         self,
         use_ema_endpoint: bool,
         ema_warmup_updates: int = 500,
     ) -> nn.Module | None:
-        """Return detached EMA endpoint model, or None to use the online model."""
+        """Frozen teacher, detached EMA endpoint, or None (online model)."""
+        teacher = self.__dict__.get("_teacher_model")
+        if teacher is not None:
+            return teacher
         if not use_ema_endpoint or self.ema_model is None:
             return None
         if self._ema_update_count < ema_warmup_updates:
@@ -833,12 +861,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         advantage_threshold: float = 0.0,
         use_ema_endpoint: bool = False,
         ema_warmup_updates: int = 500,
+        zero_x0_prob: float = 0.0,
     ) -> Tensor:
         """Rectified-flow reflow aux loss on straight paths (noise -> flow endpoint).
 
         Operates in normalized action space, matching ``get_cfm_loss``.
-        Endpoint integration may use a detached EMA copy; velocity regression always
-        uses the online model.
+        Endpoint integration may use a frozen teacher or detached EMA copy;
+        velocity regression always uses the online model.
         """
         batch = self.normalize_inputs(batch)
         obs_cond = self.model.encode_observations(batch)
@@ -848,19 +877,30 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         device = obs_cond.device
 
         x0 = torch.randn(B, n_samples_per_obs, H, D, device=device)
-        obs_cond_flat = (
-            obs_cond[:, None, :]
+        if zero_x0_prob > 0.0:
+            zero_mask = torch.rand(B, n_samples_per_obs, 1, 1, device=device) < zero_x0_prob
+            x0 = torch.where(zero_mask, torch.zeros_like(x0), x0)
+
+        integration_model = self._reflow_integration_model(
+            use_ema_endpoint, ema_warmup_updates
+        )
+        endpoint_obs = obs_cond
+        teacher = self.__dict__.get("_teacher_model")
+        if teacher is not None:
+            integration_model = teacher
+            with torch.no_grad():
+                endpoint_obs = teacher.encode_observations(batch)
+
+        endpoint_obs_flat = (
+            endpoint_obs[:, None, :]
             .expand(B, n_samples_per_obs, -1)
             .reshape(B * n_samples_per_obs, -1)
         )
         x0_flat = x0.reshape(B * n_samples_per_obs, H, D)
 
-        integration_model = self._reflow_integration_model(
-            use_ema_endpoint, ema_warmup_updates
-        )
         with torch.no_grad():
             x1_prime = self._integrate_flow(
-                obs_cond_flat,
+                endpoint_obs_flat,
                 x0_flat,
                 n_steps=self.config.sampling_steps,
                 integration_model=integration_model,
@@ -893,6 +933,62 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             obs_weights = sample_weights[:, None].expand_as(per_sample_loss)
             return (obs_weights * per_sample_loss).sum() / (obs_weights.sum() + 1e-8)
         return per_sample_loss.mean()
+
+    def get_teacher_kd_loss(
+        self,
+        batch: dict[str, Tensor],
+        step_bins: list[int] | None = None,
+        zero_x0_prob: float = 0.0,
+    ) -> tuple[Tensor, dict[str, float]]:
+        """Match student few-step actions to a frozen teacher's full-step action.
+
+        Same x0 for teacher and student. Teacher endpoints are stopgrad.
+        """
+        teacher = self.__dict__.get("_teacher_model")
+        device = next(self.model.parameters()).device
+        if teacher is None:
+            zero = torch.tensor(0.0, device=device)
+            return zero, {}
+
+        max_steps = int(self.config.sampling_steps)
+        bins = list(step_bins) if step_bins is not None else [1, 4, 8]
+        bins = [int(s) for s in bins if 0 < int(s) < max_steps]
+        if not bins:
+            zero = torch.tensor(0.0, device=device)
+            return zero, {}
+
+        batch = self.normalize_inputs(batch)
+        obs_student = self.model.encode_observations(batch)
+        with torch.no_grad():
+            obs_teacher = teacher.encode_observations(batch)
+
+        B = obs_student.shape[0]
+        H = self.config.horizon
+        D = self.model.action_dim
+        x0 = torch.randn(B, H, D, device=obs_student.device)
+        if zero_x0_prob > 0.0:
+            zero_mask = torch.rand(B, 1, 1, device=obs_student.device) < zero_x0_prob
+            x0 = torch.where(zero_mask, torch.zeros_like(x0), x0)
+
+        with torch.no_grad():
+            action_teacher = self._integrate_flow(
+                obs_teacher,
+                x0,
+                n_steps=max_steps,
+                integration_model=teacher,
+            )
+
+        total_loss = torch.tensor(0.0, device=obs_student.device)
+        metrics: dict[str, float] = {}
+        for steps in bins:
+            action_low = self._integrate_flow(obs_student, x0, n_steps=int(steps))
+            step_loss = (action_low - action_teacher).pow(2).mean()
+            total_loss = total_loss + step_loss
+            metrics[f"teacher_kd_{steps}"] = float(step_loss.item())
+
+        loss = total_loss / float(len(bins))
+        metrics["teacher_kd_loss"] = float(loss.item())
+        return loss, metrics
 
     def get_adaptive_compute_loss(
         self,
