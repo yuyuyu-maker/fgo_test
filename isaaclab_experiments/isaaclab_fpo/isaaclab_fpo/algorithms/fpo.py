@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import os
 
 import numpy as np
 import torch
@@ -16,6 +17,8 @@ from typing import TYPE_CHECKING
 
 from isaaclab_fpo.modules import ActorCritic
 from isaaclab_fpo.modules.ema import ExponentialMovingAverage
+from isaaclab_fpo.modules.normalizer import EmpiricalNormalization
+from isaaclab_fpo.modules.reflow_extensions import map_gap_to_reflow_lambda
 from isaaclab_fpo.storage import RolloutStorage
 
 if TYPE_CHECKING:
@@ -117,6 +120,15 @@ class FPO:
         self.reflow_mode = cfg.reflow_mode
         self.reflow_advantage_threshold = cfg.reflow_advantage_threshold
         self.reflow_use_ema_endpoint = cfg.reflow_use_ema_endpoint
+        self.reflow_adaptive_lambda_enabled = cfg.reflow_adaptive_lambda_enabled
+        self.reflow_lambda_min = cfg.reflow_lambda_min
+        self.reflow_lambda_max = cfg.reflow_lambda_max
+        self.reflow_lambda_gap_low = cfg.reflow_lambda_gap_low
+        self.reflow_lambda_gap_high = cfg.reflow_lambda_gap_high
+        self.reflow_lambda_ema = cfg.reflow_lambda_ema
+        self.reflow_lambda_warmup_iters = int(cfg.reflow_lambda_warmup_iters)
+        self._adaptive_reflow_coef = float(cfg.reflow_lambda_max)
+        self._last_adaptive_reflow_gap = 0.0
         self.theory_metrics_enabled = cfg.theory_metrics_enabled
         self.adaptive_compute_enabled = cfg.adaptive_compute_enabled
         self.adaptive_compute_loss_coef = cfg.adaptive_compute_loss_coef
@@ -124,6 +136,16 @@ class FPO:
         self.random_x0_consistency_enabled = cfg.random_x0_consistency_enabled
         self.random_x0_consistency_coef = cfg.random_x0_consistency_coef
         self.random_x0_consistency_steps = list(cfg.random_x0_consistency_steps)
+        self.reflow_teacher_checkpoint = str(cfg.reflow_teacher_checkpoint or "")
+        self.teacher_kd_enabled = bool(cfg.teacher_kd_enabled)
+        self.teacher_kd_coef = float(cfg.teacher_kd_coef)
+        self.teacher_kd_steps = list(cfg.teacher_kd_steps)
+        self.teacher_aux_zero_x0_prob = float(cfg.teacher_aux_zero_x0_prob)
+        self._teacher_actor: nn.Module | None = None
+        self._teacher_obs_normalizer: EmpiricalNormalization | None = None
+        self._last_teacher_kd_metrics: dict[str, float] = {}
+        if self.reflow_teacher_checkpoint:
+            self._load_frozen_teacher(self.reflow_teacher_checkpoint)
         self.update_counter = 0
         self._last_theory_metrics: dict[str, float] = {}
         self._last_adaptive_metrics: dict[str, float] = {}
@@ -134,9 +156,18 @@ class FPO:
                 f"coef={self.reflow_loss_coef}, "
                 f"n_samples_per_obs={self.reflow_n_samples_per_obs}, "
                 f"ema_endpoint={self.reflow_use_ema_endpoint}, "
+                f"adaptive_lambda={self.reflow_adaptive_lambda_enabled}, "
+                f"lambda_warmup_iters={self.reflow_lambda_warmup_iters}, "
                 f"theory_metrics={self.theory_metrics_enabled}, "
                 f"adaptive_compute={self.adaptive_compute_enabled}, "
-                f"random_x0_consistency={self.random_x0_consistency_enabled}"
+                f"random_x0_consistency={self.random_x0_consistency_enabled}, "
+                f"teacher_kd={self.teacher_kd_enabled}"
+            )
+        if self._teacher_actor is not None:
+            print(
+                f"Frozen reflow teacher loaded from {self.reflow_teacher_checkpoint} "
+                f"(kd={self.teacher_kd_enabled}, kd_steps={self.teacher_kd_steps}, "
+                f"aux_zero_x0_prob={self.teacher_aux_zero_x0_prob})"
             )
         if self.random_x0_consistency_enabled:
             print(
@@ -286,12 +317,49 @@ class FPO:
         self.transition.clear()
         self.policy.reset(dones)
 
-    def _reflow_endpoint_actor(self) -> nn.Module | None:
-        """Detached EMA actor for reflow endpoints, or None to use the online actor.
+    def _load_frozen_teacher(self, checkpoint_path: str) -> None:
+        """Load a frozen baseline actor + its obs normalizer for reflow endpoints / KD."""
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                f"reflow_teacher_checkpoint not found: {checkpoint_path}"
+            )
+        loaded = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        model_sd = loaded["model_state_dict"]
+        actor_sd = {
+            key[len("actor.") :]: value
+            for key, value in model_sd.items()
+            if key.startswith("actor.")
+        }
+        teacher_actor = copy.deepcopy(self.policy.actor).to(self.device)
+        teacher_actor.load_state_dict(actor_sd)
+        teacher_actor.eval()
+        for param in teacher_actor.parameters():
+            param.requires_grad_(False)
+        self._teacher_actor = teacher_actor
 
-        Before EMA warmup, shadow params are still at initialization — using them as
-        endpoints is harmful, so we fall back to the online actor until warmup ends.
-        """
+        obs_dim = int(self.policy.num_actor_obs)
+        teacher_norm = EmpiricalNormalization(shape=(obs_dim,)).to(self.device)
+        teacher_norm.load_state_dict(loaded["obs_norm_state_dict"])
+        teacher_norm.eval()
+        self._teacher_obs_normalizer = teacher_norm
+
+    def _to_teacher_obs(
+        self, student_obs: torch.Tensor, student_normalizer: nn.Module | None
+    ) -> torch.Tensor:
+        """Map student-normalized obs into the frozen teacher's normalization."""
+        if self._teacher_obs_normalizer is None:
+            return student_obs
+        with torch.no_grad():
+            if student_normalizer is not None and hasattr(student_normalizer, "inverse"):
+                raw = student_normalizer.inverse(student_obs)
+            else:
+                raw = student_obs
+            return self._teacher_obs_normalizer(raw)
+
+    def _reflow_endpoint_actor(self) -> nn.Module | None:
+        """Frozen baseline actor, detached EMA actor, or None (online actor)."""
+        if self._teacher_actor is not None:
+            return self._teacher_actor
         if not self.reflow_use_ema_endpoint or self.ema is None:
             return None
         if self.tot_timesteps <= self.ema_warmup_steps:
@@ -335,6 +403,7 @@ class FPO:
         mean_reflow_loss = 0
         mean_adaptive_compute_loss = 0
         mean_random_x0_consistency_loss = 0
+        mean_teacher_kd_loss = 0
         mean_entropy = 0
         mean_kl = 0
 
@@ -560,6 +629,22 @@ class FPO:
 
             reflow_loss = torch.tensor(0.0, device=self.device)
             if self.reflow_enabled:
+                if self.reflow_adaptive_lambda_enabled and mini_batch_step == 0:
+                    gap_obs = obs_batch[: min(128, obs_batch.shape[0])]
+                    gap = self.policy.compute_random_x0_step_gap(gap_obs, low_steps=1)
+                    self._last_adaptive_reflow_gap = gap
+                    if self.update_counter >= self.reflow_lambda_warmup_iters:
+                        target = map_gap_to_reflow_lambda(
+                            gap,
+                            self.reflow_lambda_min,
+                            self.reflow_lambda_max,
+                            self.reflow_lambda_gap_low,
+                            self.reflow_lambda_gap_high,
+                        )
+                        ema = self.reflow_lambda_ema
+                        self._adaptive_reflow_coef = (
+                            ema * self._adaptive_reflow_coef + (1.0 - ema) * target
+                        )
                 # IMPORTANT: do NOT copy EMA weights onto the training actor.
                 # Endpoints must come from a detached EMA copy; CFM prediction stays
                 # on the online actor. The old store/copy/restore path made both use
@@ -574,6 +659,12 @@ class FPO:
                     reflow_mode=self.reflow_mode,
                     advantage_threshold=self.reflow_advantage_threshold,
                     endpoint_actor=self._reflow_endpoint_actor(),
+                    endpoint_obs=self._to_teacher_obs(obs_batch, obs_normalizer)
+                    if self._teacher_actor is not None
+                    else None,
+                    zero_x0_prob=self.teacher_aux_zero_x0_prob
+                    if self._teacher_actor is not None
+                    else 0.0,
                 )
 
                 if self.theory_metrics_enabled and mini_batch_step == 0:
@@ -600,13 +691,36 @@ class FPO:
                     )
                 )
 
+            teacher_kd_loss = torch.tensor(0.0, device=self.device)
+            if self.teacher_kd_enabled:
+                if self._teacher_actor is None:
+                    raise RuntimeError(
+                        "teacher_kd_enabled requires reflow_teacher_checkpoint"
+                    )
+                teacher_kd_loss, self._last_teacher_kd_metrics = (
+                    self.policy.get_teacher_kd_loss(
+                        obs_batch,
+                        self._to_teacher_obs(obs_batch, obs_normalizer),
+                        teacher_actor=self._teacher_actor,
+                        step_bins=self.teacher_kd_steps,
+                        zero_x0_prob=self.teacher_aux_zero_x0_prob,
+                    )
+                )
+
             loss = surrogate_loss + self.value_loss_coef * value_loss
             if self.reflow_enabled:
-                loss = loss + self.reflow_loss_coef * reflow_loss
+                reflow_coef = (
+                    self._adaptive_reflow_coef
+                    if self.reflow_adaptive_lambda_enabled
+                    else self.reflow_loss_coef
+                )
+                loss = loss + reflow_coef * reflow_loss
             if self.adaptive_compute_enabled:
                 loss = loss + self.adaptive_compute_loss_coef * adaptive_loss
             if self.random_x0_consistency_enabled:
                 loss = loss + self.random_x0_consistency_coef * random_x0_loss
+            if self.teacher_kd_enabled:
+                loss = loss + self.teacher_kd_coef * teacher_kd_loss
             if entropy_bonus is not None:
                 loss -= self.knn_entropy_coef * entropy_bonus
 
@@ -651,6 +765,8 @@ class FPO:
                 mean_adaptive_compute_loss += adaptive_loss.item()
             if self.random_x0_consistency_enabled:
                 mean_random_x0_consistency_loss += random_x0_loss.item()
+            if self.teacher_kd_enabled:
+                mean_teacher_kd_loss += teacher_kd_loss.item()
             mean_entropy += entropy_bonus.item() if entropy_bonus is not None else 0.0
 
             mini_batch_step += 1
@@ -665,6 +781,8 @@ class FPO:
             mean_adaptive_compute_loss /= num_updates
         if self.random_x0_consistency_enabled:
             mean_random_x0_consistency_loss /= num_updates
+        if self.teacher_kd_enabled:
+            mean_teacher_kd_loss /= num_updates
         mean_entropy /= num_updates
         if self.schedule == "adaptive":
             mean_kl /= num_updates
@@ -681,6 +799,9 @@ class FPO:
         }
         if self.reflow_enabled:
             loss_dict["reflow_loss"] = mean_reflow_loss
+            if self.reflow_adaptive_lambda_enabled:
+                loss_dict["adaptive_reflow_coef"] = self._adaptive_reflow_coef
+                loss_dict["adaptive_reflow_gap"] = self._last_adaptive_reflow_gap
         if self.adaptive_compute_enabled:
             loss_dict["adaptive_compute_loss"] = mean_adaptive_compute_loss
             for key, value in self._last_adaptive_metrics.items():
@@ -689,6 +810,11 @@ class FPO:
             loss_dict["random_x0_consistency_loss"] = mean_random_x0_consistency_loss
             for key, value in self._last_random_x0_metrics.items():
                 if key != "random_x0_consistency_loss":
+                    loss_dict[key] = value
+        if self.teacher_kd_enabled:
+            loss_dict["teacher_kd_loss"] = mean_teacher_kd_loss
+            for key, value in self._last_teacher_kd_metrics.items():
+                if key != "teacher_kd_loss":
                     loss_dict[key] = value
         if self.theory_metrics_enabled:
             for key, value in self._last_theory_metrics.items():

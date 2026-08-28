@@ -348,6 +348,36 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     reflow_use_ema_endpoint: bool = False
     """Use EMA actor weights (detached) to generate reflow endpoints (policy improvement operator)."""
 
+    reflow_adaptive_lambda_enabled: bool = False
+    """Adapt ``reflow_loss_coef`` from the 1-vs-N discretization gap (random x0).
+
+    Collection protocol stays ``train_flow_x0_mode=random`` (same as baseline).
+    Large gap → λ near ``reflow_lambda_max``; already-straight → shrink toward min
+    so full-step / random@N return is not taxed forever.
+    """
+
+    reflow_lambda_min: float = 0.1
+    """Floor for adaptive reflow λ."""
+
+    reflow_lambda_max: float = 1.0
+    """Ceiling for adaptive reflow λ (same default as plain reflow)."""
+
+    reflow_lambda_gap_low: float = 0.05
+    """1-step RMS gap below this maps to ``reflow_lambda_min``."""
+
+    reflow_lambda_gap_high: float = 0.4
+    """1-step RMS gap above this maps to ``reflow_lambda_max``."""
+
+    reflow_lambda_ema: float = 0.9
+    """EMA on the adaptive λ across PPO updates (0 = no smoothing)."""
+
+    reflow_lambda_warmup_iters: int = 50
+    """Keep λ at ``reflow_lambda_max`` for this many PPO updates.
+
+    Untrained 1-step and N-step actions can look similar (small gap) even when
+    the path is not straight; adapting immediately would collapse λ to the floor.
+    """
+
     theory_metrics_enabled: bool = False
     """Log path straightness and discretization error proxies during training."""
 
@@ -376,11 +406,34 @@ class FpoRslRlPpoAlgorithmCfg:  # Keeping name for backwards compatibility
     random_x0_consistency_steps: list[int] = None  # type: ignore[assignment]
     """Few-step budgets compared against full ``sampling_steps`` under the same x0."""
 
+    reflow_teacher_checkpoint: str = ""
+    """Frozen baseline checkpoint whose 64-step actor supplies reflow endpoints / KD targets.
+
+    Empty disables the frozen teacher. Collection stays ``train_flow_x0_mode=random``.
+    """
+
+    teacher_kd_enabled: bool = False
+    """Distill student few-step Euler onto stopgrad teacher 64-step actions (same x0)."""
+
+    teacher_kd_coef: float = 0.1
+    """Coefficient for ``teacher_kd`` when enabled."""
+
+    teacher_kd_steps: list[int] = None  # type: ignore[assignment]
+    """Student Euler budgets matched to the teacher 64-step action."""
+
+    teacher_aux_zero_x0_prob: float = 0.25
+    """Fraction of auxiliary (reflow/KD) samples that use x0=0 (deploy protocol).
+
+    Does not change on-policy collection, which stays fully random.
+    """
+
     def __post_init__(self):
         if self.adaptive_step_bins is None:
             self.adaptive_step_bins = [1, 4, 8, 16, 64]
         if self.random_x0_consistency_steps is None:
             self.random_x0_consistency_steps = [1, 4, 8]
+        if self.teacher_kd_steps is None:
+            self.teacher_kd_steps = [1, 4, 8]
 
 
 #########################

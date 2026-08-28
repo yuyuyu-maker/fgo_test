@@ -239,16 +239,26 @@ class ActorCritic(nn.Module):
         reflow_mode: str = "uniform",
         advantage_threshold: float = 0.0,
         endpoint_actor: torch.nn.Module | None = None,
+        endpoint_obs: torch.Tensor | None = None,
+        zero_x0_prob: float = 0.0,
     ) -> torch.Tensor:
         """Rectified Flow reflow loss on straight paths between noise and flow endpoints."""
         assert len(observations.shape) == 2
         batch_size, action_dim = observations.shape[0], self.num_actions
         device = observations.device
+        endpoint_obs = observations if endpoint_obs is None else endpoint_obs
+        assert endpoint_obs.shape == observations.shape
 
         x0 = torch.randn(
             batch_size, n_samples_per_obs, action_dim, device=device
         )
-        flat_obs = observations[:, None, :].expand(
+        if zero_x0_prob > 0.0:
+            zero_mask = (
+                torch.rand(batch_size, n_samples_per_obs, 1, device=device)
+                < zero_x0_prob
+            )
+            x0 = torch.where(zero_mask, torch.zeros_like(x0), x0)
+        flat_endpoint_obs = endpoint_obs[:, None, :].expand(
             batch_size, n_samples_per_obs, -1
         ).reshape(batch_size * n_samples_per_obs, -1)
         flat_x0 = x0.reshape(batch_size * n_samples_per_obs, action_dim)
@@ -260,7 +270,7 @@ class ActorCritic(nn.Module):
             )
             x1_prime = self._integrate_flow_with_actor(
                 integration_actor,
-                flat_obs,
+                flat_endpoint_obs,
                 flat_x0,
                 t_current,
                 dt,
@@ -361,6 +371,55 @@ class ActorCritic(nn.Module):
         metrics["random_x0_consistency_loss"] = loss.item()
         return loss, metrics
 
+    def get_teacher_kd_loss(
+        self,
+        student_obs: torch.Tensor,
+        teacher_obs: torch.Tensor,
+        teacher_actor: torch.nn.Module,
+        step_bins: list[int] | None = None,
+        zero_x0_prob: float = 0.0,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Match student few-step actions to a frozen teacher's 64-step action.
+
+        Same x0 for teacher and student. Teacher endpoints are stopgrad.
+        """
+        assert student_obs.shape == teacher_obs.shape
+        batch_size = student_obs.shape[0]
+        device = student_obs.device
+        bins = list(step_bins) if step_bins is not None else [1, 4, 8]
+        bins = [int(s) for s in bins if 0 < int(s) < self.sampling_steps]
+        if not bins:
+            zero = torch.tensor(0.0, device=device)
+            return zero, {}
+
+        x0 = torch.randn(batch_size, self.num_actions, device=device)
+        if zero_x0_prob > 0.0:
+            zero_mask = torch.rand(batch_size, 1, device=device) < zero_x0_prob
+            x0 = torch.where(zero_mask, torch.zeros_like(x0), x0)
+
+        with torch.no_grad():
+            t_full, dt_full, steps_full = self._flow_integration_grid(
+                device, self.sampling_steps
+            )
+            action_teacher = self._integrate_flow_with_actor(
+                teacher_actor, teacher_obs, x0, t_full, dt_full, steps_full
+            )
+
+        total_loss = torch.tensor(0.0, device=device)
+        metrics: dict[str, float] = {}
+        for steps in bins:
+            t_k, dt_k, flow_steps = self._flow_integration_grid(device, steps)
+            action_low = self._integrate_flow(
+                student_obs, x0, t_k, dt_k, flow_steps
+            )
+            step_loss = (action_low - action_teacher).pow(2).mean()
+            total_loss = total_loss + step_loss
+            metrics[f"teacher_kd_{steps}"] = step_loss.item()
+
+        loss = total_loss / float(len(bins))
+        metrics["teacher_kd_loss"] = loss.item()
+        return loss, metrics
+
     def get_adaptive_compute_loss(
         self,
         observations: torch.Tensor,
@@ -456,6 +515,28 @@ class ActorCritic(nn.Module):
             gap = compute_discretization_gap(x1, x1_low).mean().item()
             metrics[f"discretization_gap_{low_steps}"] = gap
         return metrics
+
+    @torch.no_grad()
+    def compute_random_x0_step_gap(
+        self,
+        observations: torch.Tensor,
+        low_steps: int = 1,
+    ) -> float:
+        """RMS ||a_N - a_k|| under x0 ~ N(0,I), matching baseline collection/eval-random."""
+        batch_size = observations.shape[0]
+        device = observations.device
+        x0 = torch.randn(batch_size, self.num_actions, device=device)
+        t_full, dt_full, steps_full = self._flow_integration_grid(
+            device, self.sampling_steps
+        )
+        action_full = self._integrate_flow(
+            observations, x0, t_full, dt_full, steps_full
+        )
+        t_k, dt_k, flow_steps = self._flow_integration_grid(device, low_steps)
+        action_low = self._integrate_flow(
+            observations, x0, t_k, dt_k, flow_steps
+        )
+        return compute_discretization_gap(action_full, action_low).mean().item()
 
     def _integrate_flow_with_actor(
         self,

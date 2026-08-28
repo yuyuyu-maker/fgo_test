@@ -44,6 +44,29 @@ class UnitreeGo2FlatFlowPPORunnerCfgReflow(UnitreeGo2FlatFlowPPORunnerCfg):
 
 
 @configclass
+class UnitreeGo2FlatFlowPPORunnerCfgReflowAdaptiveLambda(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Go2 reflow with λ_r adapted from random-x0 1-vs-64 discretization gap.
+
+    Collection stays random x0 (same as baseline / plain reflow).
+    """
+
+    experiment_name = "unitree_go2_reflow_adaptive_lambda"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_adaptive_lambda_enabled=True,
+        reflow_lambda_min=0.1,
+        reflow_lambda_max=1.0,
+        reflow_lambda_gap_low=0.05,
+        reflow_lambda_gap_high=0.4,
+        reflow_lambda_ema=0.9,
+        reflow_lambda_warmup_iters=50,
+        theory_metrics_enabled=True,
+    )
+
+
+@configclass
 class UnitreeGo2FlatFlowPPORunnerCfgReflowRandomX0(UnitreeGo2FlatFlowPPORunnerCfg):
     """Reflow + random-x0 few-step consistency (close PostEval random gap)."""
 
@@ -63,6 +86,32 @@ class UnitreeGo2FlatFlowPPORunnerCfgReflowRandomX0(UnitreeGo2FlatFlowPPORunnerCf
         random_x0_consistency_enabled=True,
         random_x0_consistency_coef=0.1,
         random_x0_consistency_steps=[1, 4, 8],
+    )
+
+
+_GO2_BASELINE_TEACHER_500 = (
+    "/workspace/plsy/fgo_test/isaaclab_experiments/logs/isaaclab_fpo/"
+    "go2_baseline_500/2026-08-27_14-53-04_2026-08-27_14-52-10_baseline/model_499.pt"
+)
+
+
+@configclass
+class UnitreeGo2FlatFlowPPORunnerCfgReflowTeacherKd(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Reflow student with frozen baseline 64-step teacher + few-step KD.
+
+    Collection stays random x0 (no mix). Deploy the student (zero init, few-step).
+    """
+
+    experiment_name = "unitree_go2_reflow_teacher_kd"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_teacher_checkpoint=_GO2_BASELINE_TEACHER_500,
+        teacher_kd_enabled=True,
+        teacher_kd_coef=0.1,
+        teacher_kd_steps=[1, 4, 8],
+        teacher_aux_zero_x0_prob=0.25,
     )
 
 
@@ -154,15 +203,52 @@ class UnitreeGo2FlatFlowPPORunnerCfgAllIdeas(UnitreeGo2FlatFlowPPORunnerCfg):
     )
 
 
+@configclass
+class UnitreeGo2FlatFlowPPORunnerCfgAllIdeasTeacherKd(UnitreeGo2FlatFlowPPORunnerCfg):
+    """Teacher-KD reflow + stacked ideas: reward_aware, adaptive_compute, theory.
+
+    Frozen baseline supplies reflow endpoints (not EMA / fpo_operator).
+    Collection stays random x0 (no mix).
+    """
+
+    experiment_name = "unitree_go2_all_ideas_teacher_kd"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        adaptive_compute_enabled=True,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="reward_aware",
+        reflow_advantage_threshold=0.0,
+        reflow_teacher_checkpoint=_GO2_BASELINE_TEACHER_500,
+        teacher_kd_enabled=True,
+        teacher_kd_coef=0.1,
+        teacher_kd_steps=[1, 4, 8],
+        teacher_aux_zero_x0_prob=0.25,
+        theory_metrics_enabled=True,
+        adaptive_compute_enabled=True,
+        adaptive_compute_loss_coef=0.1,
+        adaptive_latency_penalty_coef=1.0,
+    )
+
+
 GO2_FPO_VARIANTS = {
     "baseline": UnitreeGo2FlatFlowPPORunnerCfg,
     "reflow": UnitreeGo2FlatFlowPPORunnerCfgReflow,
+    "reflow_adaptive_lambda": UnitreeGo2FlatFlowPPORunnerCfgReflowAdaptiveLambda,
     "reflow_random_x0": UnitreeGo2FlatFlowPPORunnerCfgReflowRandomX0,
+    "reflow_teacher_kd": UnitreeGo2FlatFlowPPORunnerCfgReflowTeacherKd,
     "reward_aware": UnitreeGo2FlatFlowPPORunnerCfgRewardAware,
     "adaptive_compute": UnitreeGo2FlatFlowPPORunnerCfgAdaptiveCompute,
     "fpo_operator": UnitreeGo2FlatFlowPPORunnerCfgFpoOperator,
     "theory": UnitreeGo2FlatFlowPPORunnerCfgTheory,
     "all_ideas": UnitreeGo2FlatFlowPPORunnerCfgAllIdeas,
+    "all_ideas_teacher_kd": UnitreeGo2FlatFlowPPORunnerCfgAllIdeasTeacherKd,
 }
 
 @configclass
@@ -349,6 +435,31 @@ class G1FlatFlowPPORunnerCfgReflow(G1FlatFlowPPORunnerCfg):
     )
 
 
+_G1_BASELINE_TEACHER_2000 = (
+    "/workspace/plsy/fgo_test/isaaclab_experiments/logs/isaaclab_fpo/"
+    "g1_flat_flow/2026-08-27_00-04-43_2026-08-27_00-02-39_g1_baseline/model_1999.pt"
+)
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgReflowTeacherKd(G1FlatFlowPPORunnerCfg):
+    """G1 reflow student with frozen full baseline teacher + few-step KD."""
+
+    experiment_name = "g1_reflow_teacher_kd"
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_teacher_checkpoint=_G1_BASELINE_TEACHER_2000,
+        teacher_kd_enabled=True,
+        teacher_kd_coef=0.1,
+        teacher_kd_steps=[1, 4, 8],
+        teacher_aux_zero_x0_prob=0.25,
+    )
+
+
 @configclass
 class G1FlatFlowPPORunnerCfgReflowRandomX0(G1FlatFlowPPORunnerCfg):
     """G1: reflow + random-x0 few-step consistency."""
@@ -472,15 +583,80 @@ class G1FlatFlowPPORunnerCfgAllIdeas(G1FlatFlowPPORunnerCfg):
     )
 
 
+@configclass
+class G1FlatFlowPPORunnerCfgAllIdeasFpo(G1FlatFlowPPORunnerCfg):
+    """G1 stack: fpo_operator + adaptive_compute + theory (fixed EMA endpoint)."""
+
+    experiment_name = "g1_reflow_all_ideas_fpo"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        adaptive_compute_enabled=True,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="fpo_operator",
+        reflow_use_ema_endpoint=True,
+        theory_metrics_enabled=True,
+        adaptive_compute_enabled=True,
+        adaptive_compute_loss_coef=0.1,
+        adaptive_latency_penalty_coef=1.0,
+    )
+
+
+@configclass
+class G1FlatFlowPPORunnerCfgAllIdeasTeacherKd(G1FlatFlowPPORunnerCfg):
+    """Full G1 stack: frozen baseline teacher + KD + fpo_operator weights + adaptive + theory.
+
+    EMA endpoints are off: the frozen teacher owns x1. Collection stays random.
+    """
+
+    experiment_name = "g1_all_ideas_teacher_kd"
+    policy = FpoRslRlPpoActorCriticCfg(
+        init_noise_std=1.0,
+        actor_hidden_dims=[256, 256, 256],
+        critic_hidden_dims=[768, 768, 768],
+        activation="elu",
+        adaptive_compute_enabled=True,
+    )
+    algorithm = FpoRslRlPpoAlgorithmCfg(
+        n_samples_per_action=32,
+        num_learning_epochs=32,
+        reflow_enabled=True,
+        reflow_loss_coef=1.0,
+        reflow_n_samples_per_obs=4,
+        reflow_mode="fpo_operator",
+        reflow_use_ema_endpoint=False,
+        reflow_teacher_checkpoint=_G1_BASELINE_TEACHER_2000,
+        teacher_kd_enabled=True,
+        teacher_kd_coef=0.1,
+        teacher_kd_steps=[1, 4, 8],
+        teacher_aux_zero_x0_prob=0.25,
+        theory_metrics_enabled=True,
+        adaptive_compute_enabled=True,
+        adaptive_compute_loss_coef=0.1,
+        adaptive_latency_penalty_coef=1.0,
+    )
+
+
 G1_FPO_VARIANTS = {
     "baseline": G1FlatFlowPPORunnerCfg,
     "reflow": G1FlatFlowPPORunnerCfgReflow,
+    "reflow_teacher_kd": G1FlatFlowPPORunnerCfgReflowTeacherKd,
     "reflow_random_x0": G1FlatFlowPPORunnerCfgReflowRandomX0,
     "reward_aware": G1FlatFlowPPORunnerCfgRewardAware,
     "adaptive_compute": G1FlatFlowPPORunnerCfgAdaptiveCompute,
     "fpo_operator": G1FlatFlowPPORunnerCfgFpoOperator,
     "theory": G1FlatFlowPPORunnerCfgTheory,
     "all_ideas": G1FlatFlowPPORunnerCfgAllIdeas,
+    "all_ideas_fpo": G1FlatFlowPPORunnerCfgAllIdeasFpo,
+    "all_ideas_teacher_kd": G1FlatFlowPPORunnerCfgAllIdeasTeacherKd,
 }
 
 

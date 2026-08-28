@@ -19,6 +19,12 @@ def add_fpo_args(parser: argparse.ArgumentParser):
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
     arg_group.add_argument(
+        "--teacher_checkpoint",
+        type=str,
+        default=None,
+        help="Frozen baseline checkpoint for reflow endpoints / teacher KD.",
+    )
+    arg_group.add_argument(
         "--logger", type=str, default=None, choices={"wandb", "tensorboard", "neptune"}, help="Logger module to use."
     )
     arg_group.add_argument(
@@ -28,12 +34,16 @@ def add_fpo_args(parser: argparse.ArgumentParser):
         choices={
             "baseline",
             "reflow",
+            "reflow_adaptive_lambda",
             "reflow_random_x0",
+            "reflow_teacher_kd",
             "reward_aware",
             "adaptive_compute",
             "fpo_operator",
             "theory",
             "all_ideas",
+            "all_ideas_teacher_kd",
+            "all_ideas_fpo",
         },
         help="FPO config variant for Go2 / Spot / G1 velocity tasks (overrides default task config when set).",
     )
@@ -95,6 +105,8 @@ def update_fpo_cfg(agent_cfg: FpoRslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.load_run = args_cli.load_run
     if args_cli.checkpoint is not None:
         agent_cfg.load_checkpoint = args_cli.checkpoint
+    if getattr(args_cli, "teacher_checkpoint", None):
+        agent_cfg.algorithm.reflow_teacher_checkpoint = args_cli.teacher_checkpoint
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
     if hasattr(args_cli, "experiment_name") and args_cli.experiment_name is not None:

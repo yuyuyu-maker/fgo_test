@@ -13,6 +13,7 @@ from isaaclab_fpo.modules.reflow_extensions import (
     compute_advantage_reflow_weights,
     compute_discretization_gap,
     compute_path_straightness,
+    map_gap_to_reflow_lambda,
 )
 from isaaclab_fpo.rl_cfg import FpoRslRlPpoActorCriticCfg
 from isaaclab_fpo.task_cfgs import GO2_FPO_VARIANTS
@@ -34,6 +35,9 @@ def test_reflow_extensions():
     gap = compute_discretization_gap(x0, x1)
     assert gap.shape == (4,)
 
+    assert abs(map_gap_to_reflow_lambda(0.0, 0.1, 1.0, 0.05, 0.4) - 0.1) < 1e-6
+    assert abs(map_gap_to_reflow_lambda(1.0, 0.1, 1.0, 0.05, 0.4) - 1.0) < 1e-6
+
     pred = StepPredictor(num_obs=48, step_bins=[1, 4, 8, 16, 64])
     obs = torch.randn(8, 48)
     steps = pred.predict_steps(obs)
@@ -53,12 +57,15 @@ def test_actor_critic_variants():
 
     for name in (
         "reflow",
+        "reflow_adaptive_lambda",
         "reflow_random_x0",
+        "reflow_teacher_kd",
         "reward_aware",
         "adaptive_compute",
         "fpo_operator",
         "theory",
         "all_ideas",
+        "all_ideas_teacher_kd",
     ):
         variant = GO2_FPO_VARIANTS[name]()
         cfg = variant.policy
@@ -96,6 +103,21 @@ def test_actor_critic_variants():
             metrics = policy.compute_theory_metrics(obs[:8])
             assert "path_straightness" in metrics
             assert any(k.startswith("discretization_gap_") for k in metrics)
+
+        if variant.algorithm.reflow_adaptive_lambda_enabled:
+            gap = policy.compute_random_x0_step_gap(obs[:8], low_steps=1)
+            assert gap >= 0.0
+
+        if variant.algorithm.teacher_kd_enabled:
+            loss, metrics = policy.get_teacher_kd_loss(
+                obs,
+                obs,
+                teacher_actor=policy.actor,
+                step_bins=variant.algorithm.teacher_kd_steps,
+                zero_x0_prob=variant.algorithm.teacher_aux_zero_x0_prob,
+            )
+            assert torch.isfinite(loss).all(), f"{name} teacher_kd loss not finite"
+            assert "teacher_kd_loss" in metrics
 
 
 def main():

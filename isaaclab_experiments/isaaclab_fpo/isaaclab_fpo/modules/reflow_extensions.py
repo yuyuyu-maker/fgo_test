@@ -49,6 +49,19 @@ def compute_discretization_gap(
     return (action_full - action_low).pow(2).mean(dim=-1).sqrt()
 
 
+def map_gap_to_reflow_lambda(
+    gap: float,
+    lambda_min: float,
+    lambda_max: float,
+    gap_low: float,
+    gap_high: float,
+) -> float:
+    """Larger 1-vs-N gap → larger reflow weight; already-straight → shrink λ."""
+    span = max(gap_high - gap_low, 1e-8)
+    t = min(1.0, max(0.0, (float(gap) - gap_low) / span))
+    return float(lambda_min + t * (lambda_max - lambda_min))
+
+
 class StepPredictor(nn.Module):
     """Predict discrete flow integration budget from observations."""
 

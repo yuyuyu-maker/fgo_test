@@ -523,8 +523,20 @@ class OnPolicyRunner:
                 self.privileged_obs_normalizer.state_dict()
             )
 
-        # save model
-        torch.save(saved_dict, path)
+        # Atomic write: a crash/full-disk mid-save used to truncate the
+        # previous checkpoint and abort training (seen on /dev/shm).
+        tmp_path = f"{path}.tmp"
+        try:
+            torch.save(saved_dict, tmp_path)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            print(f"[WARN] checkpoint save failed ({path}): {exc}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            return
 
         # upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
