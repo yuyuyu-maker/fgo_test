@@ -199,12 +199,12 @@ def _run_rollouts(
         # Track episode returns
         for env_idx in range(num_parallel_envs):
             episode_returns[env_idx] += reward[env_idx].item()
+            episode_steps[env_idx] += 1
 
         if save_video:
             frames = env.render()
             for env_idx in range(num_parallel_envs):
                 episode_frames[env_idx].append(frames[env_idx])
-                episode_steps[env_idx] += 1
 
         total_steps += num_parallel_envs
         done = terminated | truncated
@@ -222,9 +222,12 @@ def _run_rollouts(
                 dones_list[env_idx].append(1)
                 successes_list[env_idx].append(int(is_success))
 
-                # discard the frames from the terminated environments since it is a new observation on the reseted new environment
-                episode_frames[env_idx].pop(-1)
-                episode_steps[env_idx] -= 1
+                # Last render is the reset observation of the next episode; drop it.
+                # Skip when video is off — frames are never appended in that path.
+                if save_video and episode_frames[env_idx]:
+                    episode_frames[env_idx].pop(-1)
+                if episode_steps[env_idx] > 0:
+                    episode_steps[env_idx] -= 1
 
                 # Record per-episode stats
                 all_episode_returns.append(episode_returns[env_idx])

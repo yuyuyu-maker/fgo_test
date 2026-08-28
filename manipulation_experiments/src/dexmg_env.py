@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from robosuite import macros
 
@@ -286,11 +287,20 @@ class RobosuiteGymWrapper:
         """Reset the environment and return initial observation."""
         # Gymnasium interface: reset can accept seed and options
         # For robosuite environments, we'll ignore these for now
-        obs = self.env.reset()
-        processed_obs = self._process_obs(obs)
-        self._last_obs = processed_obs  # Store for video recording
-        self.episode_steps = 0
-        return processed_obs, {}
+        last_err = None
+        for attempt in range(5):
+            try:
+                obs = self.env.reset()
+                processed_obs = self._process_obs(obs)
+                self._last_obs = processed_obs  # Store for video recording
+                self.episode_steps = 0
+                return processed_obs, {}
+            except OSError as e:
+                last_err = e
+                logger = logging.getLogger(__name__)
+                logger.warning("env.reset failed (attempt %s/5): %s", attempt + 1, e)
+                time.sleep(0.5 * (attempt + 1))
+        raise last_err
 
     def step(self, action):
         """Step the environment with the given action."""

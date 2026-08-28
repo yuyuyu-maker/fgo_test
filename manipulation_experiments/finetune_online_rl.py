@@ -137,6 +137,10 @@ class FlowPPOConfig:
     eval_num_episodes: int = 10
     eval_camera_size: int = 84
     eval_ema: bool = False
+    save_eval_video: bool = False
+
+    # Resume from a prior FPO finetune checkpoint (policy/ + optimizer.pt).
+    resume_checkpoint_path: Optional[str] = None
 
     # System
     seed: Optional[int] = None
@@ -165,6 +169,7 @@ class FlowPPOConfig:
     reflow_mode: Literal["uniform", "reward_aware", "fpo_operator"] = "uniform"
     reflow_advantage_threshold: float = 0.0
     reflow_use_ema_endpoint: bool = False
+    reflow_ema_warmup_updates: int = 500
     adaptive_compute_enabled: bool = False
     adaptive_compute_loss_coef: float = 0.1
     adaptive_latency_penalty_coef: float = 1.0
@@ -254,6 +259,7 @@ def _run_rollouts(
     num_episodes: int,
     task: str,
     zero_sampling: bool,
+    record_video: bool = False,
 ):
     save_dir.mkdir(parents=True, exist_ok=True)
     was_training = policy.training
@@ -274,7 +280,7 @@ def _run_rollouts(
 
     now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     video_path = save_dir / f"eval_step_{global_step}_{now}.mp4"
-    video_writer = imageio.get_writer(video_path.as_posix(), fps=20)
+    video_writer = imageio.get_writer(video_path.as_posix(), fps=20) if record_video else None
 
     obs, _ = env.reset()
     episode_frames = [[] for _ in range(num_parallel_envs)]
@@ -292,11 +298,12 @@ def _run_rollouts(
             action, mdp_x_t_path = policy.select_action(obs, zero_sampling=zero_sampling, sde_sampling=False)
 
         obs, reward, terminated, truncated, info = env.step(action)
-        frames = env.render()
+        frames = env.render() if record_video else None
 
-        for env_idx in range(num_parallel_envs):
-            episode_frames[env_idx].append(frames[env_idx])
-            episode_steps[env_idx] += 1
+        if record_video:
+            for env_idx in range(num_parallel_envs):
+                episode_frames[env_idx].append(frames[env_idx])
+                episode_steps[env_idx] += 1
 
         total_steps += num_parallel_envs
         done = terminated | truncated
@@ -312,21 +319,24 @@ def _run_rollouts(
                 done_episodes_list.append(1)
                 successes_list.append(int(is_success))
 
-                # discard the frames from the terminated environments since it is a new observation on the reseted new environment
-                episode_frames[env_idx].pop(-1)
-                episode_steps[env_idx] -= 1
+                # Last render is the reset observation of the next episode; drop it.
+                # Skip when video is off — frames are never appended in that path.
+                if record_video and episode_frames[env_idx]:
+                    episode_frames[env_idx].pop(-1)
+                    episode_steps[env_idx] -= 1
 
-                for step_idx, frame in enumerate(episode_frames[env_idx]):
-                    annotated_frame = _annotate_frame(
-                        frame=frame,
-                        env_idx=env_idx,
-                        episode_num=sum(done_episodes_list),
-                        total_episodes=num_episodes,
-                        episode_step=step_idx + 1,
-                        is_success=is_success,
-                        font=font,
-                    )
-                    video_writer.append_data(annotated_frame)
+                if record_video and video_writer is not None:
+                    for step_idx, frame in enumerate(episode_frames[env_idx]):
+                        annotated_frame = _annotate_frame(
+                            frame=frame,
+                            env_idx=env_idx,
+                            episode_num=sum(done_episodes_list),
+                            total_episodes=num_episodes,
+                            episode_step=step_idx + 1,
+                            is_success=is_success,
+                            font=font,
+                        )
+                        video_writer.append_data(annotated_frame)
 
                 episode_frames[env_idx] = []
                 episode_steps[env_idx] = 0
@@ -341,7 +351,8 @@ def _run_rollouts(
     successes = sum(successes_list[:num_episodes])
     done_episodes = sum(done_episodes_list[:num_episodes])
 
-    video_writer.close()
+    if video_writer is not None:
+        video_writer.close()
     success_rate = successes / done_episodes if done_episodes > 0 else 0.0
 
     if was_training:
@@ -354,9 +365,10 @@ def _run_rollouts(
     logger.info(f"Evaluation completed: {done_episodes} episodes, {successes} successes ({success_rate * 100:.1f}%)")
     logger.info(f"Performance: {total_steps} total steps in {elapsed:.1f}s")
     logger.info(f"Average FPS: {fps:.1f} frames/sec | Episodes/sec: {eps_sec:.2f}")
-    logger.info(f"Video saved: {video_path}")
+    if record_video:
+        logger.info(f"Video saved: {video_path}")
 
-    return success_rate, video_path, fps, int(successes), int(done_episodes)
+    return success_rate, video_path if record_video else None, fps, int(successes), int(done_episodes)
 
 def eval_all_ranks(
     *,
@@ -401,18 +413,19 @@ def eval_all_ranks(
     local_video_path = None
 
     if eps_this_rank > 0:
-        # Only rank 0 records a video to avoid N videos
-        save_video = (rank == 0)
+        save_video = (rank == 0) and cfg.save_eval_video
         eval_actor.init_action_buffers(num_envs_eval_rank)
+        eval_scratch = Path(os.environ.get("TMPDIR", "/tmp")) / "fpo_eval_scratch"
         # Eval with zero sampling
         sr, video_path, fps, succ, eps = _run_rollouts(
             policy=eval_actor,
             env=env,
-            save_dir=(run_dir / "videos") if save_video else (run_dir / "_scratch_no_video"),
+            save_dir=(run_dir / "videos") if save_video else eval_scratch,
             global_step=global_step,
             num_episodes=eps_this_rank,
             task=cfg.eval_env,
             zero_sampling=True,
+            record_video=save_video,
         )
         local_successes = succ
         local_episodes  = eps
@@ -423,11 +436,12 @@ def eval_all_ranks(
         sr_non_zero, video_path_non_zero, fps_non_zero, succ_non_zero, eps_non_zero = _run_rollouts(
             policy=eval_actor,
             env=env,
-            save_dir=(run_dir / "videos") if save_video else (run_dir / "_scratch_no_video"),
+            save_dir=(run_dir / "videos") if save_video else eval_scratch,
             global_step=global_step,
             num_episodes=eps_this_rank,
             task=cfg.eval_env,
             zero_sampling=False,
+            record_video=save_video,
         )
         local_successes_non_zero = succ_non_zero
         local_episodes_non_zero = eps_non_zero
@@ -649,7 +663,13 @@ def main(cfg: FlowPPOConfig):
 
     if rank == 0:
         # Decide policy directory or load artifacts
-        if cfg.base_policy_wandb_run_id is not None:
+        if cfg.resume_checkpoint_path is not None:
+            resume_root = Path(cfg.resume_checkpoint_path)
+            policy_dir = resume_root / "policy"
+            if not policy_dir.exists():
+                raise ValueError(f"Resume checkpoint missing policy/: {resume_root}")
+            logger.info(colored(f"[Global] Resuming from checkpoint: {resume_root}", "cyan"))
+        elif cfg.base_policy_wandb_run_id is not None:
             alias = cfg.checkpoint_step if cfg.checkpoint_step is not None else "latest"
             if cfg.wandb_project is None:
                 raise ValueError("--wandb_project is required when using --base_policy_wandb_run_id")
@@ -947,6 +967,26 @@ def main(cfg: FlowPPOConfig):
     iteration = 0
     best_eval_success_rate = 0.0
     training_cum_time = 0.0
+
+    resume_root: Path | None = None
+    if cfg.resume_checkpoint_path is not None:
+        resume_root = Path(cfg.resume_checkpoint_path)
+        if rank == 0:
+            opt_blob = torch.load(resume_root / "optimizer.pt", map_location="cpu")
+            optimizer_actor.load_state_dict(opt_blob["optimizer_state_dict"])
+            global_step = int(opt_blob.get("step", 0))
+            logger.info(colored(f"Resumed actor optimizer from step {global_step}", "green"))
+        if is_ddp:
+            step_tensor = torch.tensor([global_step], device=device, dtype=torch.long)
+            dist.broadcast(step_tensor, src=0)
+            global_step = int(step_tensor.item())
+        steps_per_iter = cfg.data_collection_steps * cfg.num_envs
+        iteration = global_step // steps_per_iter if steps_per_iter > 0 else 0
+        if rank == 0:
+            logger.info(colored(
+                f"Resume: global_step={global_step}, iteration={iteration}, "
+                f"remaining≈{max(0, cfg.total_timesteps - global_step)} steps", "yellow"
+            ))
 
     obs_state_stored = torch.zeros((steps_per_iteration, num_envs_per_process, joint_pos_dim))
     actions_stored = torch.zeros((steps_per_iteration, num_envs_per_process, action_dim))
@@ -1403,6 +1443,7 @@ def main(cfg: FlowPPOConfig):
                             reflow_mode=cfg.reflow_mode,
                             advantage_threshold=cfg.reflow_advantage_threshold,
                             use_ema_endpoint=cfg.reflow_use_ema_endpoint,
+                            ema_warmup_updates=cfg.reflow_ema_warmup_updates,
                         )
                         loss = loss + (cfg.reflow_loss_coef * reflow_loss) / cfg.gradient_accumulation_steps
                         reflow_loss_val = float(reflow_loss.detach().item())

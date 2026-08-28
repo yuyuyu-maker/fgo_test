@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 """Flow Matching Policy Implementation"""
+import copy
 from collections import deque
 from typing import Union
 
@@ -119,6 +120,10 @@ class FlowMatchingPolicy(PreTrainedPolicy):
                 model_config=None,
             )
 
+        # Detached flow copy for fpo_operator reflow endpoints (never swap training weights).
+        self._reflow_endpoint_model = None
+        self._ema_update_count = 0
+
         # Exploration noise value (can be set dynamically)
         self.exploration_noise_std = config.exploration_noise_std  
 
@@ -184,6 +189,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         """Update the EMA model with current model parameters."""
         if self.ema_model is not None:
             self.ema_model.step(self.model.parameters())
+            self._ema_update_count += 1
 
     def enable_ema(self):
         """Switch to using EMA weights for inference."""
@@ -719,29 +725,62 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             out[key] = expanded.reshape(B * n_samples, *value.shape[1:])
         return out
 
+    def _ensure_reflow_endpoint_model(self) -> nn.Module:
+        """Frozen deepcopy of the flow net for EMA endpoint integration only."""
+        if self._reflow_endpoint_model is None:
+            endpoint = copy.deepcopy(self.model)
+            endpoint.eval()
+            for param in endpoint.parameters():
+                param.requires_grad_(False)
+            self._reflow_endpoint_model = endpoint
+        return self._reflow_endpoint_model
+
+    def _sync_reflow_endpoint_from_ema(self) -> None:
+        """Copy EMA shadow weights into the detached endpoint model."""
+        if self.ema_model is None:
+            return
+        endpoint = self._ensure_reflow_endpoint_model()
+        for param, shadow in zip(endpoint.parameters(), self.ema_model.shadow_params):
+            param.data.copy_(shadow.to(param.device))
+
+    def _reflow_integration_model(
+        self,
+        use_ema_endpoint: bool,
+        ema_warmup_updates: int = 500,
+    ) -> nn.Module | None:
+        """Return detached EMA endpoint model, or None to use the online model."""
+        if not use_ema_endpoint or self.ema_model is None:
+            return None
+        if self._ema_update_count < ema_warmup_updates:
+            return None
+        self._sync_reflow_endpoint_from_ema()
+        return self._reflow_endpoint_model
+
     def _predict_velocity(
         self,
         x_t: Tensor,
         t_scalar: Tensor,
         obs_cond: Tensor,
+        flow_model: nn.Module | None = None,
     ) -> Tensor:
         """Predict flow velocity at continuous time t for batch of trajectories."""
+        model = flow_model if flow_model is not None else self.model
         B = x_t.shape[0]
         # diffusion_step_encoder accepts (B, 1, 1) or (B,) style inputs like CFM path
         if t_scalar.ndim == 0:
             t_in = t_scalar.reshape(1).expand(B)
-            timeembedding = self.model.diffusion_step_encoder(t_in)
+            timeembedding = model.diffusion_step_encoder(t_in)
         elif t_scalar.ndim == 1:
-            timeembedding = self.model.diffusion_step_encoder(t_scalar)
+            timeembedding = model.diffusion_step_encoder(t_scalar)
         else:
-            timeembedding = self.model.diffusion_step_encoder(t_scalar)
+            timeembedding = model.diffusion_step_encoder(t_scalar)
             timeembedding = timeembedding.reshape(B, -1)
         if timeembedding.ndim == 1:
             timeembedding = timeembedding.unsqueeze(0).expand(B, -1)
         elif timeembedding.shape[0] == 1 and B > 1:
             timeembedding = timeembedding.expand(B, -1)
 
-        network_output = self.model(x_t, timeembedding, obs_cond)
+        network_output = model(x_t, timeembedding, obs_cond)
         network_output = self.config.mlp_output_scale * network_output
         if self.config.transported_clip_value is not None:
             network_output = network_output.clamp(
@@ -763,32 +802,27 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         obs_cond: Tensor,
         x_t: Tensor,
         n_steps: int | None = None,
-        use_ema_endpoint: bool = False,
+        integration_model: nn.Module | None = None,
     ) -> Tensor:
         """Euler-integrate flow from noise x_t (t=1) to data (t=0) in normalized action space.
 
-        If use_ema_endpoint, temporarily swap in EMA weights for the integration only.
-        Caller should wrap with torch.no_grad() when endpoints must be detached.
+        Optionally integrate with a detached copy (e.g. EMA snapshot). Never mutate the
+        online ``self.model`` here — that path destabilized ``fpo_operator`` training.
         """
-        used_ema = False
-        if use_ema_endpoint and getattr(self, "ema_model", None) is not None:
-            self.enable_ema()
-            used_ema = True
-        try:
-            flow_steps = int(n_steps) if n_steps is not None else int(self.config.sampling_steps)
-            flow_steps = max(flow_steps, 1)
-            t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=x_t.device)
-            x = x_t
-            for i in range(flow_steps):
-                t_current = t_path[i]
-                t_next = t_path[i + 1]
-                dt = t_next - t_current
-                velocity = self._predict_velocity(x, t_current, obs_cond)
-                x = x + velocity * dt
-            return x
-        finally:
-            if used_ema:
-                self.disable_ema()
+        flow_model = integration_model if integration_model is not None else self.model
+        flow_steps = int(n_steps) if n_steps is not None else int(self.config.sampling_steps)
+        flow_steps = max(flow_steps, 1)
+        t_path = torch.linspace(1.0, 0.0, flow_steps + 1, device=x_t.device)
+        x = x_t
+        for i in range(flow_steps):
+            t_current = t_path[i]
+            t_next = t_path[i + 1]
+            dt = t_next - t_current
+            velocity = self._predict_velocity(
+                x, t_current, obs_cond, flow_model=flow_model
+            )
+            x = x + velocity * dt
+        return x
 
     def get_reflow_loss(
         self,
@@ -798,10 +832,13 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         reflow_mode: str = "uniform",
         advantage_threshold: float = 0.0,
         use_ema_endpoint: bool = False,
+        ema_warmup_updates: int = 500,
     ) -> Tensor:
         """Rectified-flow reflow aux loss on straight paths (noise -> flow endpoint).
 
         Operates in normalized action space, matching ``get_cfm_loss``.
+        Endpoint integration may use a detached EMA copy; velocity regression always
+        uses the online model.
         """
         batch = self.normalize_inputs(batch)
         obs_cond = self.model.encode_observations(batch)
@@ -818,12 +855,15 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         )
         x0_flat = x0.reshape(B * n_samples_per_obs, H, D)
 
+        integration_model = self._reflow_integration_model(
+            use_ema_endpoint, ema_warmup_updates
+        )
         with torch.no_grad():
             x1_prime = self._integrate_flow(
                 obs_cond_flat,
                 x0_flat,
                 n_steps=self.config.sampling_steps,
-                use_ema_endpoint=use_ema_endpoint,
+                integration_model=integration_model,
             )
         x1_prime = x1_prime.reshape(B, n_samples_per_obs, H, D)
 

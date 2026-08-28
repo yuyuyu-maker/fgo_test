@@ -63,8 +63,19 @@ def test_policy_losses_if_available() -> None:
         output_shapes={"action": [7]},
         ema_power=0.75,
     )
+    cfg.state_features = ["observation.state"]
+    stats = {
+        "observation.state": {
+            "mean": torch.zeros(10),
+            "std": torch.ones(10),
+        },
+        "action": {
+            "mean": torch.zeros(7),
+            "std": torch.ones(7),
+        },
+    }
     try:
-        policy = FlowMatchingPolicy(cfg)
+        policy = FlowMatchingPolicy(cfg, dataset_stats=stats)
     except Exception as exc:  # pragma: no cover
         print(f"skip policy smoke (construct failed): {exc}")
         return
@@ -86,6 +97,22 @@ def test_policy_losses_if_available() -> None:
         batch, n_samples_per_obs=2, advantages=adv, reflow_mode="fpo_operator"
     )
     assert torch.isfinite(loss_u) and torch.isfinite(loss_ra) and torch.isfinite(loss_op)
+
+    # fpo_operator must not mutate online weights via EMA swap (fixed endpoint copy).
+    if policy.ema_model is not None:
+        for _ in range(3):
+            policy.step_ema()
+        w_before = next(policy.model.parameters()).detach().clone()
+        policy.get_reflow_loss(
+            batch,
+            n_samples_per_obs=2,
+            advantages=adv,
+            reflow_mode="fpo_operator",
+            use_ema_endpoint=True,
+            ema_warmup_updates=0,
+        )
+        w_after = next(policy.model.parameters()).detach()
+        assert torch.allclose(w_before, w_after), "EMA endpoint path mutated online model"
 
     policy.ensure_step_predictor([1, 2])
     adaptive_loss, metrics = policy.get_adaptive_compute_loss(

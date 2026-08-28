@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Launch 5 reflow-idea FPO++ variants for ONE task on ONE GPU.
 #
+# NOTE: For paper-matched hyperparameters use run_task_reflow_baseline.sh instead
+# (30 envs, full timesteps, rollout eval every 2 iters). This script kept for
+# quick probes only.
+#
 # Usage:
 #   GPU=0 TASK=Can CKPT_DIR=.../checkpoints/step_25 \
 #     bash scripts/launch_task_reflow_ideas.sh
