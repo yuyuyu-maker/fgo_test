@@ -700,7 +700,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
     def ensure_step_predictor(self, step_bins: list[int] | None = None) -> StepPredictor:
         """Lazily create StepPredictor on observation conditioning dim."""
         if getattr(self, "step_predictor", None) is None:
-            bins = list(step_bins) if step_bins is not None else [1, 2, 4, 8]
+            bins = list(step_bins) if step_bins is not None else [1, 2, 4]
             self.step_predictor = StepPredictor(
                 num_obs=self.model.global_cond_dim,
                 step_bins=bins,
@@ -767,6 +767,18 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         for param in teacher.parameters():
             param.requires_grad_(False)
         self.__dict__["_teacher_model"] = teacher
+
+    def attach_frozen_ppo_teacher(self, gaussian_policy: nn.Module) -> None:
+        """Freeze a Gaussian PPO policy as action teacher for KD only.
+
+        Reflow endpoints stay on the student (PPO is not a flow field). Same
+        protocol as locomotion ``teacher_kind=ppo``.
+        """
+        gaussian_policy.eval()
+        for param in gaussian_policy.parameters():
+            param.requires_grad_(False)
+        self.__dict__["_ppo_teacher"] = gaussian_policy
+        # Do not set _teacher_model: reflow must not treat PPO as a flow endpoint.
 
     def _reflow_integration_model(
         self,
@@ -940,27 +952,35 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         step_bins: list[int] | None = None,
         zero_x0_prob: float = 0.0,
     ) -> tuple[Tensor, dict[str, float]]:
-        """Match student few-step actions to a frozen teacher's full-step action.
+        """Match student few-step actions to a frozen teacher's action.
 
-        Same x0 for teacher and student. Teacher endpoints are stopgrad.
+        Flow teacher: same x0, teacher full-step integrate (stopgrad).
+        PPO teacher: distill to frozen Gaussian mean (normalized); include full
+        Euler budget in the step bins (locomotion-style).
         """
+        ppo_teacher = self.__dict__.get("_ppo_teacher")
         teacher = self.__dict__.get("_teacher_model")
         device = next(self.model.parameters()).device
-        if teacher is None:
+        if ppo_teacher is None and teacher is None:
             zero = torch.tensor(0.0, device=device)
             return zero, {}
 
         max_steps = int(self.config.sampling_steps)
-        bins = list(step_bins) if step_bins is not None else [1, 4, 8]
-        bins = [int(s) for s in bins if 0 < int(s) < max_steps]
+        bins = list(step_bins) if step_bins is not None else [1, 2, 4]
+        if ppo_teacher is not None:
+            bins = [int(s) for s in bins if 0 < int(s) <= max_steps]
+            if max_steps not in bins:
+                bins = [max_steps] + bins
+        else:
+            bins = [int(s) for s in bins if 0 < int(s) < max_steps]
         if not bins:
             zero = torch.tensor(0.0, device=device)
             return zero, {}
 
+        # PPO teacher normalizes internally; keep a raw copy for it.
+        batch_raw = batch
         batch = self.normalize_inputs(batch)
         obs_student = self.model.encode_observations(batch)
-        with torch.no_grad():
-            obs_teacher = teacher.encode_observations(batch)
 
         B = obs_student.shape[0]
         H = self.config.horizon
@@ -971,23 +991,33 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             x0 = torch.where(zero_mask, torch.zeros_like(x0), x0)
 
         with torch.no_grad():
-            action_teacher = self._integrate_flow(
-                obs_teacher,
-                x0,
-                n_steps=max_steps,
-                integration_model=teacher,
-            )
+            if ppo_teacher is not None:
+                mean, _, _ = ppo_teacher._mean_and_std(
+                    {k: v for k, v in batch_raw.items() if k not in {ACTION, "mdp_x_t_path"}}
+                )
+                action_teacher = mean[:, :H]
+            else:
+                obs_teacher = teacher.encode_observations(batch)
+                action_teacher = self._integrate_flow(
+                    obs_teacher,
+                    x0,
+                    n_steps=max_steps,
+                    integration_model=teacher,
+                )
 
         total_loss = torch.tensor(0.0, device=obs_student.device)
         metrics: dict[str, float] = {}
         for steps in bins:
             action_low = self._integrate_flow(obs_student, x0, n_steps=int(steps))
-            step_loss = (action_low - action_teacher).pow(2).mean()
+            t_h = min(action_low.shape[1], action_teacher.shape[1])
+            step_loss = (action_low[:, :t_h] - action_teacher[:, :t_h]).pow(2).mean()
             total_loss = total_loss + step_loss
             metrics[f"teacher_kd_{steps}"] = float(step_loss.item())
 
         loss = total_loss / float(len(bins))
         metrics["teacher_kd_loss"] = float(loss.item())
+        if ppo_teacher is not None:
+            metrics["teacher_kind"] = 1.0  # PPO
         return loss, metrics
 
     def get_adaptive_compute_loss(
@@ -998,7 +1028,7 @@ class FlowMatchingPolicy(PreTrainedPolicy):
         step_bins: list[int] | None = None,
     ) -> tuple[Tensor, dict[str, float]]:
         """Train step predictor: match low-step actions to full-step with latency penalty."""
-        bins = list(step_bins) if step_bins is not None else [1, 2, 4, 8]
+        bins = list(step_bins) if step_bins is not None else [1, 2, 4]
         max_steps = int(self.config.sampling_steps)
         bins = [int(s) for s in bins if 0 < int(s) < max_steps]
         if not bins:
@@ -1085,5 +1115,11 @@ class FlowMatchingPolicy(PreTrainedPolicy):
             gap = compute_discretization_gap(x1, x1_low).mean().item()
             metrics[f"discretization_gap_{low_steps}"] = float(gap)
         return metrics
+
+
+
+
+
+
 
 

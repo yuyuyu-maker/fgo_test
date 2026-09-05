@@ -444,6 +444,18 @@ def load_policy(checkpoint_dir: Path, device: str = "cuda", load_ema: bool = Fal
 
     logger.info(colored(f"Loading model weights from {weights_path}...", "cyan"))
     state_dict = load_file(weights_path, device=device)
+    # Ours / adaptive_compute checkpoints include StepPredictor; construct it
+    # before strict load so unexpected-key errors do not fire.
+    if any(k.startswith("step_predictor.") for k in state_dict):
+        bins = None
+        sp_w = state_dict.get("step_predictor.net.2.weight")
+        if sp_w is not None and hasattr(sp_w, "shape"):
+            # last Linear: (num_bins, hidden) → infer bin count; bins list only
+            # needs matching length for module construction.
+            num_bins = int(sp_w.shape[0])
+            bins = [2 ** i for i in range(num_bins)]
+        policy.ensure_step_predictor(bins)
+        logger.info(colored(f"Initialized step_predictor for checkpoint load (bins={bins})", "cyan"))
     policy.load_state_dict(state_dict, strict=True)
 
     policy.to(device)

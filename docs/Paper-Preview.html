@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Method &amp; Experiments</title>
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<style>
+body { font-family: "Times New Roman","Source Han Serif SC","Noto Serif SC",serif; font-size:16.5px; line-height:1.65; max-width:860px; margin:32px auto 80px; padding:0 28px; color:#1a1a1a; }
+h1 { font-size:28px; text-align:center; }
+h2 { font-size:22px; border-bottom:1px solid #ccc; padding-bottom:4px; margin-top:40px; }
+h3 { font-size:18px; margin-top:28px; }
+p,li { text-align:justify; }
+nav { background:#f6f7f8; padding:10px 14px; border-radius:6px; margin-bottom:24px; font-size:14px; }
+nav a { color:#123; margin-right:14px; }
+table { border-collapse:collapse; width:100%; margin:12px 0 8px; font-size:13px; font-family:"Helvetica Neue",Arial,sans-serif; }
+th,td { border:1px solid #bbb; padding:4px 6px; text-align:center; }
+th { background:#eef1f4; }
+td:first-child,th:first-child { text-align:left; }
+.caption { font-size:13.5px; color:#555; margin:0 0 16px; font-family:"Helvetica Neue",Arial,sans-serif; }
+figure { margin:16px 0; }
+figure img { width:100%; height:auto; border:1px solid #ddd; }
+figcaption { font-size:13px; color:#555; text-align:center; margin-top:6px; }
+.note { background:#fff8e6; border:1px solid #ead7a0; padding:10px 12px; font-size:14px; }
+</style>
+</head>
+<body>
+<h1>Online Reflow for Flow Policies</h1>
+<p class="caption" style="text-align:center">Method &amp; Experiments · 本地预览 http://127.0.0.1:8765/Paper-Preview.html</p>
+<nav>
+  <a href="#method">Method</a>
+  <a href="#setup">Setup</a>
+  <a href="#main">Main</a>
+  <a href="#ablation">Ablations</a>
+  <a href="#prior">IsaacLab</a>
+  <a href="#qual">Qualitative</a>
+</nav>
+
+<p class="note">Ours 的总目标不含 $\mathcal{L}_{\mathrm{rx0}}$ 与 EMA 端点。主实验是官方 Go2 MDP。IsaacLab 只留一条 FPO++ 先行记录。</p>
+
+<h1 id="method">Method</h1>
+<p>完整方法只使用：$\mathcal{L}_{\mathrm{FPO}}$、reward-aware 在线 Reflow、自适应积分预算、辅助零初值混合（$p_0=0.25$）、冻结 PPO 教师蒸馏。</p>
+
+<h2>Problem Formulation</h2>
+<p>条件流策略将观测 $o$ 映射为动作 $a\in\mathbb{R}^{d_a}$。速度场 $v_\theta(o,t,x)$；$t=1$ 噪声端，$t=0$ 动作端。</p>
+$$x_t = t\,x_0+(1-t)\,x_1,\qquad u^\star(x_0,x_1)=x_0-x_1.$$
+$$a=\mathrm{ODE}_{v_\theta}^{(N)}(o,x_0),\quad N=64.$$
+<p>少步 $k\ll N$（尤其 $k=1$）下弯曲传输放大离散误差。本文在 FPO++ 上叠加在线 Reflow 与 PPO 动作蒸馏。</p>
+
+<h2>Overall Framework</h2>
+$$\mathcal{L}_{\mathrm{FPO}}=\mathcal{L}_{\mathrm{surr}}+\lambda_V\mathcal{L}_V.$$
+<p>Ours：</p>
+$$\mathcal{L}=\mathcal{L}_{\mathrm{FPO}}+\lambda_r\mathcal{L}_{\mathrm{reflow}}+\lambda_a\mathcal{L}_{\mathrm{ada}}+\lambda_{\mathrm{KD}}\mathcal{L}_{\mathrm{KD}}.$$
+<p>默认 $\lambda_r=1$，$\lambda_a=0.1$，$\lambda_{\mathrm{KD}}=0.1$。不包含 $\mathcal{L}_{\mathrm{rx0}}$。</p>
+
+<h2>Online Reflow</h2>
+<p>端点由学生流积分（截断梯度），直线段上回归。Ours 用 advantage 加权 $w_i=\max(A_i-\tau,0)$，$\tau=0$，$n=4$。</p>
+$$\mathcal{L}_{\mathrm{reflow}}=\sum_{i,k}\tilde w_i\,\ell_{i,k},\qquad \ell_{i,k}=\|v_\theta(o_i,t^{i,k},x_t^{i,k})-u^{i,k}\|^2_{\mathrm{red}}.$$
+
+<h2>Adaptive Compute and PPO KD</h2>
+$$\mathcal{L}_{\mathrm{ada}}=\|a_{\hat k}-a_N\|^2+\alpha\mathbb{E}[L_{\mathrm{lat}}]-\beta\mathbb{E}[\mathrm{relu}(A)].$$
+$$\mathcal{L}_{\mathrm{KD}}=\frac{1}{|K|}\sum_{k\in\{64,8,4\}}\|a^{(k)}-a_T\|^2.$$
+<p>$a_T=\mathrm{PPO}(o)$（stop-gradient）。辅助项以 $p_0=0.25$ 置零 $x_0$。</p>
+
+<h2>Variants in Experiments</h2>
+<table>
+<tr><th>Name</th><th>Reflow</th><th>Weighting</th><th>Adaptive</th><th>$p_0$</th><th>PPO KD</th></tr>
+<tr><td>FPO++</td><td>off</td><td>—</td><td>off</td><td>0</td><td>off</td></tr>
+<tr><td>reflow</td><td>on</td><td>uniform</td><td>off</td><td>0</td><td>off</td></tr>
+<tr><td>reward-aware</td><td>on</td><td>advantage</td><td>off</td><td>0</td><td>off</td></tr>
+<tr><td>KD-only</td><td>off</td><td>—</td><td>off</td><td>0</td><td>on</td></tr>
+<tr><td>reflow+KD</td><td>on</td><td>uniform</td><td>off</td><td>0</td><td>on</td></tr>
+<tr><td>Ours</td><td>on</td><td>advantage</td><td>on</td><td>0.25</td><td>on</td></tr>
+</table>
+<p>IsaacLab Flat Go2 上曾用同一套 FPO++ 基线做过先行验证。该栈缺少官方 MDP 对齐、PPO 教师与部署域随机化，真机效果不好，因此不作为主方法。</p>
+
+<h1 id="experiments">Experiments</h1>
+<h2 id="setup">Experimental Setup</h2>
+<p>主表：官方 Unitree-Go2-Velocity play，256 envs × 10 episodes。IsaacLab Flat Go2 仅作 FPO++ 先行对照，不与主表混绝对值。</p>
+
+<h2 id="main">Main Results</h2>
+<p class="caption"><strong>Table 1.</strong> 官方 Go2 play 平均回报。</p>
+<table>
+<tr><th>Method</th><th>zero@64</th><th>zero@1</th><th>random@64</th><th>random@1</th></tr>
+<tr><td>PPO</td><td>35.58</td><td>—</td><td>—</td><td>—</td></tr>
+<tr><td>FPO++</td><td>21.29</td><td>−187.7</td><td>17.66</td><td>−220.1</td></tr>
+<tr><td>KD-only</td><td>29.95</td><td>−4919.7</td><td>27.65</td><td>−5121.7</td></tr>
+<tr><td>Ours</td><td>34.78</td><td>34.25</td><td>31.56</td><td>31.50</td></tr>
+</table>
+<p>仅 KD 抬满步、不保少步。Ours 满足 1-step ≈ 64-step，满步接近 PPO。</p>
+
+<p class="caption"><strong>Table 2.</strong> 官方 Go2 步数扫描。</p>
+<table>
+<tr><th>Method</th><th>Mode</th><th>64</th><th>32</th><th>16</th><th>8</th><th>4</th><th>1</th></tr>
+<tr><td>FPO++</td><td>zero</td><td>21.29</td><td>19.06</td><td>18.78</td><td>18.56</td><td>15.43</td><td>−187.7</td></tr>
+<tr><td>FPO++</td><td>random</td><td>17.66</td><td>17.55</td><td>18.12</td><td>18.22</td><td>15.94</td><td>−220.1</td></tr>
+<tr><td>KD-only</td><td>zero</td><td>29.95</td><td>29.59</td><td>29.91</td><td>26.63</td><td>−398.1</td><td>−4919.7</td></tr>
+<tr><td>KD-only</td><td>random</td><td>27.65</td><td>27.70</td><td>28.39</td><td>26.50</td><td>−349.6</td><td>−5121.7</td></tr>
+<tr><td>Ours</td><td>zero</td><td>34.78</td><td>34.43</td><td>34.32</td><td>34.67</td><td>34.21</td><td>34.25</td></tr>
+<tr><td>Ours</td><td>random</td><td>31.56</td><td>31.58</td><td>31.73</td><td>31.82</td><td>31.96</td><td>31.50</td></tr>
+<tr><td>PPO</td><td>—</td><td>35.58</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+</table>
+
+<p class="caption"><strong>Table 3.</strong> Go2 机载 CPU、ORT 单线程。Warmup 30，重复 100。50 Hz = 20 ms。</p>
+<table>
+<tr><th>Steps</th><th>mean</th><th>p50</th><th>p90</th><th>p99</th></tr>
+<tr><td>64</td><td>4.39</td><td>3.16</td><td>7.93</td><td>20.06</td></tr>
+<tr><td>32</td><td>1.50</td><td>1.49</td><td>1.52</td><td>1.56</td></tr>
+<tr><td>16</td><td>0.79</td><td>0.77</td><td>0.84</td><td>1.07</td></tr>
+<tr><td>8</td><td>0.41</td><td>0.40</td><td>0.42</td><td>0.44</td></tr>
+<tr><td>4</td><td>0.23</td><td>0.22</td><td>0.23</td><td>0.26</td></tr>
+<tr><td>1</td><td>0.08</td><td>0.08</td><td>0.08</td><td>0.10</td></tr>
+</table>
+<p>$N\le 32$ 时 p99 远低于 20 ms。$N=64$ 的 p99 触及周期。1-step 均值 0.08 ms。</p>
+
+<p class="caption"><strong>Table 4.</strong> Ours@1 HW 指令回放。</p>
+<table>
+<tr><th>Run</th><th>Command</th><th>sim vs HW cmd</th><th>joint pos corr</th><th>MAE</th></tr>
+<tr><td>1</td><td>$v_x$</td><td>0.984</td><td>0.992</td><td>0.085</td></tr>
+<tr><td>2</td><td>$v_y$</td><td>0.983</td><td>0.995</td><td>0.079</td></tr>
+<tr><td>3</td><td>yaw</td><td>0.988</td><td>0.997</td><td>0.055</td></tr>
+</table>
+
+<h2 id="ablation">Ablations and Analysis</h2>
+<p class="caption"><strong>Table 5.</strong> Go2 消融（zero）。</p>
+<table>
+<tr><th>Method</th><th>64</th><th>32</th><th>16</th><th>8</th><th>4</th><th>1</th></tr>
+<tr><td>FPO++</td><td>21.29</td><td>19.06</td><td>18.78</td><td>18.56</td><td>15.43</td><td>−187.7</td></tr>
+<tr><td>reflow</td><td>33.57</td><td>33.50</td><td>33.50</td><td>33.45</td><td>33.18</td><td>32.84</td></tr>
+<tr><td>reward-aware</td><td>32.78</td><td>32.98</td><td>33.12</td><td>32.59</td><td>33.00</td><td>33.40</td></tr>
+<tr><td>KD-only</td><td>29.95</td><td>29.59</td><td>29.91</td><td>26.63</td><td>−398.1</td><td>−4919.7</td></tr>
+<tr><td>reflow+KD</td><td>34.65</td><td>34.44</td><td>34.77</td><td>34.77</td><td>34.92</td><td>34.39</td></tr>
+<tr><td>Ours</td><td>34.78</td><td>34.43</td><td>34.32</td><td>34.67</td><td>34.21</td><td>34.25</td></tr>
+</table>
+
+<p class="caption"><strong>Table 6.</strong> 同一消融（random）。重跑批次已有，此前未写入正文。</p>
+<table>
+<tr><th>Method</th><th>64</th><th>32</th><th>16</th><th>8</th><th>4</th><th>1</th></tr>
+<tr><td>FPO++</td><td>17.66</td><td>17.55</td><td>18.12</td><td>18.22</td><td>15.94</td><td>−220.1</td></tr>
+<tr><td>reflow</td><td>27.66</td><td>27.77</td><td>27.75</td><td>27.53</td><td>27.79</td><td>28.21</td></tr>
+<tr><td>reward-aware</td><td>28.52</td><td>27.84</td><td>27.41</td><td>28.09</td><td>28.06</td><td>28.17</td></tr>
+<tr><td>KD-only</td><td>27.65</td><td>27.70</td><td>28.39</td><td>26.50</td><td>−349.6</td><td>−5121.7</td></tr>
+<tr><td>reflow+KD</td><td>31.63</td><td>31.77</td><td>31.68</td><td>31.62</td><td>31.31</td><td>32.38</td></tr>
+<tr><td>Ours</td><td>31.56</td><td>31.58</td><td>31.73</td><td>31.82</td><td>31.96</td><td>31.50</td></tr>
+</table>
+
+<p class="caption"><strong>Table 7.</strong> 跟踪误差。reward-aware@1 的 play 回报仍高，但 $|v_x-\mathrm{cmd}|=0.805$。</p>
+<table>
+<tr><th>Method</th><th>err @64 / @1</th><th>fall @64 / @1</th></tr>
+<tr><td>PPO</td><td>0.055 / —</td><td>0.000 / —</td></tr>
+<tr><td>FPO++</td><td>0.792 / 0.883</td><td>0.000 / 0.680</td></tr>
+<tr><td>reflow</td><td>0.080 / 0.070</td><td>0.000 / 0.000</td></tr>
+<tr><td>reward-aware</td><td>0.086 / 0.805</td><td>0.000 / 0.000</td></tr>
+<tr><td>KD-only</td><td>0.178 / 0.810</td><td>0.000 / 0.334</td></tr>
+<tr><td>reflow+KD</td><td>0.068 / 0.068</td><td>0.000 / 0.000</td></tr>
+<tr><td>Ours</td><td>0.066 / 0.075</td><td>0.000 / 0.000</td></tr>
+</table>
+
+<h2 id="prior">先行记录：IsaacLab 上的 FPO++</h2>
+<p>想法先在 IsaacLab Flat Go2 的 FPO++ 上跑通：baseline 1-step 掉 9.29，加上 reward-aware 后 1-step 与 64-step 持平。该栈没有官方观测/奖励对齐、没有 PPO 教师、也没有部署用域随机化与 HW 回放，真机侧缺动作先验和 1-step 导出，实际机器效果不好。主架构因此改为官方 Go2 MDP + RA-reflow + PPO 蒸馏。Spot 全表与 $\lambda_r$ 短消融不再进入正文。</p>
+<p class="caption"><strong>Table 8.</strong> IsaacLab Flat Go2，zero-noise。与主表不可比绝对值。</p>
+<table>
+<tr><th>Method</th><th>64</th><th>1</th><th>$\Delta$</th></tr>
+<tr><td>FPO++ baseline</td><td>41.89</td><td>32.60</td><td>−9.29</td></tr>
+<tr><td>+ reward-aware Reflow</td><td>41.78</td><td>41.73</td><td>−0.04</td></tr>
+</table>
+
+<h2 id="qual">Qualitative Results</h2>
+<p>速度图统一 2×2：前进 0.8、前进+偏航、横移、站立。虚线=指令，实线=实测 $v_x$（蓝）与 $w_z$（橙）。</p>
+
+<p class="caption"><strong>Figure 1.</strong> 回报 vs $N$。水平=少步不掉分；×=崩溃。Reflow 系贴 PPO 横线。</p>
+<figure><img src="paper_figures/summary/step_sweep_zero.png" alt="sweep"><figcaption>Go2 play, zero-noise</figcaption></figure>
+
+<p class="caption"><strong>Figure 2.</strong> 机载时延 vs $N$。红线=20 ms。1-step 约 0.08 ms；64-step 的 p99 顶到周期。</p>
+<figure><img src="paper_figures/summary/latency.png" alt="lat"><figcaption>Go2 CPU, ORT 单线程</figcaption></figure>
+
+<p class="caption"><strong>Figure 3.</strong> 1-step 速度跟踪。实线贴虚线=跟得上。PPO / Ours 前进能到 0.8；FPO++@1 与 KD-only@1 的 $v_x$ 停在 0，$w_z$ 乱振。</p>
+<figure><img src="paper_figures/velocity/ppo.png" alt="PPO"><figcaption>PPO：指令可跟</figcaption></figure>
+<figure><img src="paper_figures/velocity/ours1.png" alt="Ours1"><figcaption>Ours@1：与 PPO 同形态</figcaption></figure>
+<figure><img src="paper_figures/velocity/fpo1.png" alt="FPO1"><figcaption>FPO++@1：前进失败，对应回报 −187</figcaption></figure>
+<figure><img src="paper_figures/velocity/kd1.png" alt="KD1"><figcaption>KD-only@1：同样跟不上，对应 −4919</figcaption></figure>
+
+<p class="caption"><strong>Figure 4.</strong> 俯视轨迹。前进应是长直线。PPO / Ours@1 接近直线；FPO++@1 / KD-only@1 走不远、终点乱绕。</p>
+<figure><img src="paper_figures/traj/ppo.png" alt="tPPO"><figcaption>PPO</figcaption></figure>
+<figure><img src="paper_figures/traj/ours1.png" alt="tOurs"><figcaption>Ours@1</figcaption></figure>
+<figure><img src="paper_figures/traj/fpo1.png" alt="tFPO"><figcaption>FPO++@1</figcaption></figure>
+<figure><img src="paper_figures/traj/kd1.png" alt="tKD"><figcaption>KD-only@1</figcaption></figure>
+
+<p class="caption"><strong>Figure 5.</strong> 先前画的方形走（Ours，64-step）。速度大体跟方波；约 20 s 处 $\Delta x$ 跳变，俯视被拉成水平长线，里程计不连续，不能当成方形已闭合。</p>
+<figure><img src="paper_figures/summary/square_tracking.png" alt="sqt"><figcaption>方形走速度 / 位移</figcaption></figure>
+<figure><img src="paper_figures/summary/square_traj.png" alt="sqxy"><figcaption>方形走俯视（含记录跳变）</figcaption></figure>
+
+<p class="caption"><strong>Figure 6.</strong> HW replay。蓝=真机 cmd，橙=仿真钉死同一 cmd，绿=仿真速度。关节图是仿真目标 vs 真机 $q$ 命令，相关 0.98 只说明命令对齐，不说明关节速度/IMU 对齐。</p>
+<figure><img src="paper_figures/sim2real/run4_cmd.png" alt="r1c"><figcaption>Run 1 指令回放</figcaption></figure>
+<figure><img src="paper_figures/sim2real/run4_joints.png" alt="r1j"><figcaption>Run 1 关节对比</figcaption></figure>
+<figure><img src="paper_figures/sim2real/run5_cmd.png" alt="r2c"><figcaption>Run 2 左右平移</figcaption></figure>
+<figure><img src="paper_figures/sim2real/run6_cmd.png" alt="r3c"><figcaption>Run 3 偏航</figcaption></figure>
+
+<script defer src="vendor/katex/katex.min.js"></script>
+<script defer src="vendor/katex/auto-render.min.js"></script>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  if (window.renderMathInElement) {
+    renderMathInElement(document.body, {
+      delimiters: [
+        {left: "$$", right: "$$", display: true},
+        {left: "$", right: "$", display: false}
+      ],
+      throwOnError: false
+    });
+  }
+});
+</script>
+</body>
+</html>

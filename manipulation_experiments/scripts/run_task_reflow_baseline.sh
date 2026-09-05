@@ -17,6 +17,11 @@ source source_env.sh
 export HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
 export TMPDIR="${TMPDIR:-/workspace/tmp}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
+# Pod memcg is 200GiB. Two-arm MuJoCo workers are ~2.5GiB each; 30+30 blows the cap.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 mkdir -p "$TMPDIR"
 
 GPU="${GPU:-0}"
@@ -30,11 +35,37 @@ SAVE_EVAL_VIDEO="${SAVE_EVAL_VIDEO:-0}"
 START_VARIANT="${START_VARIANT:-}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
 RESUME_CKPT="${RESUME_CKPT:-}"
-NUM_ENVS="${NUM_ENVS:-30}"
+# Empty => per-task default below (30 single-arm, 12 two-arm).
+NUM_ENVS="${NUM_ENVS:-}"
 EVAL_NUM_EPISODES="${EVAL_NUM_EPISODES:-40}"
 ROLLOUT_FREQ="${ROLLOUT_FREQ:-10}"
-SAVE_FREQ="${SAVE_FREQ:-10}"
+SAVE_FREQ="${SAVE_FREQ:-}"
 TASK_SLUG="$(echo "$TASK" | tr '[:upper:]' '[:lower:]')"
+
+resolve_baseline_teacher() {
+  # Prefer eval-best FPO++ baseline (Go2 uses a trained baseline, not BC).
+  local slug="$1"
+  local g
+  for g in 0 1; do
+    local root="${ROOT}/runs/flow_fpo_${slug}_baseline_gpu${g}_${STAMP}"
+    if [[ -f "${root}/checkpoints/best/policy/model.safetensors" ]]; then
+      echo "${root}/checkpoints/best"
+      return
+    fi
+    if [[ -f "${root}/checkpoints/latest/policy/model.safetensors" ]]; then
+      echo "${root}/checkpoints/latest"
+      return
+    fi
+    local step
+    step="$(ls -d "${root}/checkpoints"/step_* 2>/dev/null | sort -V | tail -1 || true)"
+    if [[ -n "$step" && -f "${step}/policy/model.safetensors" ]]; then
+      echo "$step"
+      return
+    fi
+  done
+  echo ""
+}
+
 
 if [[ ! -f "${CKPT_DIR}/policy/model.safetensors" ]]; then
   echo "ERROR: missing ${CKPT_DIR}/policy/model.safetensors"
@@ -51,6 +82,9 @@ case "$TASK" in
     HUBER_DELTA=0.5
     CLAMP_LOGRATIO=5
     CLAMP_OLD_CFM=4
+    DEFAULT_NUM_ENVS=30
+    # Sparse I/O: avoid bosfs thrash / disconnects (was 10).
+    DEFAULT_SAVE_FREQ=100
     ;;
   Square)
     TOTAL_TIMESTEPS=8000000
@@ -60,6 +94,8 @@ case "$TASK" in
     HUBER_DELTA=1
     CLAMP_LOGRATIO=None
     CLAMP_OLD_CFM=None
+    DEFAULT_NUM_ENVS=30
+    DEFAULT_SAVE_FREQ=100
     ;;
   TwoArmBoxCleanup)
     TOTAL_TIMESTEPS=5000000
@@ -69,6 +105,8 @@ case "$TASK" in
     HUBER_DELTA=0.1
     CLAMP_LOGRATIO=5
     CLAMP_OLD_CFM=4
+    DEFAULT_NUM_ENVS=12
+    DEFAULT_SAVE_FREQ=100
     ;;
   TwoArmLiftTray)
     TOTAL_TIMESTEPS=8000000
@@ -78,6 +116,8 @@ case "$TASK" in
     HUBER_DELTA=1
     CLAMP_LOGRATIO=5
     CLAMP_OLD_CFM=4
+    DEFAULT_NUM_ENVS=12
+    DEFAULT_SAVE_FREQ=100
     ;;
   TwoArmThreading)
     TOTAL_TIMESTEPS=8000000
@@ -87,11 +127,16 @@ case "$TASK" in
     HUBER_DELTA=0.1
     CLAMP_LOGRATIO=5
     CLAMP_OLD_CFM=4
+    DEFAULT_NUM_ENVS=12
+    DEFAULT_SAVE_FREQ=100
     ;;
   *)
     echo "Unknown TASK=$TASK"; exit 1
     ;;
 esac
+
+NUM_ENVS="${NUM_ENVS:-$DEFAULT_NUM_ENVS}"
+SAVE_FREQ="${SAVE_FREQ:-$DEFAULT_SAVE_FREQ}"
 
 WANDB_ARGS=(--wandb_enable False)
 if [[ "$WANDB" == "1" ]]; then
@@ -113,7 +158,7 @@ COMMON=(
   "${WANDB_ARGS[@]}"
   --gradient_accumulation_steps 1
   --num_minibatches 8
-  --log_freq 1
+  --log_freq "${LOG_FREQ:-50}"
   --save_freq "${SAVE_FREQ}"
   --rollout_freq "${ROLLOUT_FREQ}"
   --eval_num_episodes "${EVAL_NUM_EPISODES}"
@@ -178,6 +223,10 @@ for variant in "${VARIANTS[@]}"; do
 
   log_file="${LOG_DIR}/${variant}.log"
   out_dir="runs/flow_fpo_${TASK_SLUG}_${variant}_gpu${GPU}_${STAMP}"
+  if [[ "$variant" == "all_ideas_teacher_kd" || "$variant" == "reflow_teacher_kd" ]]; then
+    log_file="${LOG_DIR}/${variant}_rlteacher.log"
+    out_dir="runs/flow_fpo_${TASK_SLUG}_${variant}_rlteacher_gpu${GPU}_${STAMP}"
+  fi
   if [[ -n "$OUTPUT_DIR" && "$variant" == "${START_VARIANT}" ]]; then
     out_dir="$OUTPUT_DIR"
   fi
@@ -206,7 +255,7 @@ for variant in "${VARIANTS[@]}"; do
     fi
   fi
 
-  skip_at=$(( TOTAL_TIMESTEPS * 99 / 100 ))
+  skip_at=$(( TOTAL_TIMESTEPS * 95 / 100 ))
   if [[ "$latest_step" -ge "$skip_at" && "$latest_step" -gt 0 ]]; then
     echo "[$(date '+%F %T')] SKIP ${variant}: already at step_${latest_step} (>= ${skip_at})"
     continue
@@ -214,10 +263,25 @@ for variant in "${VARIANTS[@]}"; do
 
   extra_args=()
   if [[ "$variant" == "reflow_teacher_kd" || "$variant" == "all_ideas_teacher_kd" ]]; then
-    extra_args+=(--reflow_teacher_checkpoint "${TEACHER_CKPT:-$CKPT_DIR}")
+    teacher_ckpt="${TEACHER_CKPT:-}"
+    if [[ -z "$teacher_ckpt" ]]; then
+      teacher_ckpt="$(resolve_baseline_teacher "$TASK_SLUG")"
+    fi
+    if [[ -z "$teacher_ckpt" || ! -f "${teacher_ckpt}/policy/model.safetensors" ]]; then
+      echo "ERROR: ${variant} needs a trained FPO++ baseline teacher for ${TASK}."
+      echo "       Train the baseline variant first (not BC under CKPT_DIR)."
+      if [[ "$DRY_RUN" == "1" ]]; then
+        echo "  DRY_RUN: would fail here once baseline teacher is missing; continuing."
+        continue
+      fi
+      exit 1
+    fi
+    extra_args+=(--reflow_teacher_checkpoint "${teacher_ckpt}")
+    echo "[$(date '+%F %T')] Teacher for ${TASK}/${variant}: ${teacher_ckpt}"
   fi
 
-  echo "[$(date '+%F %T')] GPU${GPU} ${TASK}/${variant} (baseline FPO++) -> ${log_file}"
+  # Quote carefully: editing this script while a run is in-flight can confuse bash.
+  echo "[$(date '+%F %T')] GPU${GPU} ${TASK}/${variant} [baseline FPO++] -> ${log_file}"
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "  DRY_RUN: CUDA_VISIBLE_DEVICES=${GPU} ${COMMON[*]} --fpo_variant ${variant} --output_dir ${out_dir} ${resume_args[*]} ${extra_args[*]}"
     continue

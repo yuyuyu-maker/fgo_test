@@ -1,0 +1,40 @@
+# Git
+.git/
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Training runs
+manipulation_experiments/runs/
+manipulation_experiments/logs/
+
+# Model checkpoints
+manipulation_experiments/downloaded_checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Generated data
+**/outputs/
+**/results/
+**/runs/
+**/wandb/
+
+# Large archives
+*.tar
+*.tar.gz
+*.zip
+
+# Generated media
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.webp

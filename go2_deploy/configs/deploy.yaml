@@ -134,6 +134,52 @@ models:
     sampling_steps: 10
     zero_sampling: true
 
+  # --- Unitree-Go2-Velocity Ours (all_ideas_teacher_kd), one ONNX per flow budget ---
+  # Obs is 45-D (official unitree_rl_lab). Prefer C++ go2_ctrl + params/deploy.yaml.
+  # Python go2_deploy FPO backend is 48-D Isaac-flat — do NOT use for these ONNX.
+  ours_s64:
+    description: "Ours Unitree-Go2, flow steps=64 (baked ONNX)"
+    fpo_variant: all_ideas_teacher_kd
+    task: Unitree-Go2-Velocity
+    checkpoint: ../unitree_rl_lab/logs/fpo/unitree_go2_all_ideas_ppo_teacher/2026-09-03_01-21-56_all_ideas_ppo_teacher_resume300/model_1499.pt
+    sampling_steps: 64
+    zero_sampling: true
+  ours_s32:
+    description: "Ours Unitree-Go2, flow steps=32"
+    fpo_variant: all_ideas_teacher_kd
+    task: Unitree-Go2-Velocity
+    checkpoint: ../unitree_rl_lab/logs/fpo/unitree_go2_all_ideas_ppo_teacher/2026-09-03_01-21-56_all_ideas_ppo_teacher_resume300/model_1499.pt
+    sampling_steps: 32
+    zero_sampling: true
+  ours_s16:
+    description: "Ours Unitree-Go2, flow steps=16"
+    fpo_variant: all_ideas_teacher_kd
+    task: Unitree-Go2-Velocity
+    checkpoint: ../unitree_rl_lab/logs/fpo/unitree_go2_all_ideas_ppo_teacher/2026-09-03_01-21-56_all_ideas_ppo_teacher_resume300/model_1499.pt
+    sampling_steps: 16
+    zero_sampling: true
+  ours_s8:
+    description: "Ours Unitree-Go2, flow steps=8"
+    fpo_variant: all_ideas_teacher_kd
+    task: Unitree-Go2-Velocity
+    checkpoint: ../unitree_rl_lab/logs/fpo/unitree_go2_all_ideas_ppo_teacher/2026-09-03_01-21-56_all_ideas_ppo_teacher_resume300/model_1499.pt
+    sampling_steps: 8
+    zero_sampling: true
+  ours_s4:
+    description: "Ours Unitree-Go2, flow steps=4"
+    fpo_variant: all_ideas_teacher_kd
+    task: Unitree-Go2-Velocity
+    checkpoint: ../unitree_rl_lab/logs/fpo/unitree_go2_all_ideas_ppo_teacher/2026-09-03_01-21-56_all_ideas_ppo_teacher_resume300/model_1499.pt
+    sampling_steps: 4
+    zero_sampling: true
+  ours_s1:
+    description: "Ours Unitree-Go2, flow steps=1"
+    fpo_variant: all_ideas_teacher_kd
+    task: Unitree-Go2-Velocity
+    checkpoint: ../unitree_rl_lab/logs/fpo/unitree_go2_all_ideas_ppo_teacher/2026-09-03_01-21-56_all_ideas_ppo_teacher_resume300/model_1499.pt
+    sampling_steps: 1
+    zero_sampling: true
+
 unitree_sdk:
   # Official open-source SDK
   github: https://github.com/unitreerobotics/unitree_sdk2_python

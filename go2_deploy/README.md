@@ -35,6 +35,8 @@ backend:
 | **sport** | 宇树**内置步态** `SportClient.Move` | `--mode sport --backend sdk2` |
 | **fpo** | **FPO ONNX 推理**（Python 50Hz；可选 LowCmd） | `--mode fpo --model baseline` |
 
+宇树官方 PPO 的 Python 部署在独立目录 `/workspace/unitree_go2_ppo_deploy`，不和本仓库混用。
+
 先导出：`bash scripts/export_fpo_onnx.sh --model baseline`  
 ONNX 落在 **`go2_deploy/exported/<model>/policy.onnx`**，部署时带整个 `go2_deploy/` 即可（不需要再带 `isaaclab_experiments` 的 `.pt`）。  
 参数对齐见 `configs/fpo_go2_aligned.yaml` 与 [docs/DEPLOY_CPP_ONNX.md](docs/DEPLOY_CPP_ONNX.md)。

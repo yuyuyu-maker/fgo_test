@@ -1,0 +1,6 @@
+checkpoint=/workspace/fgo_test/unitree_rl_lab/logs/fpo/unitree_go2_all_ideas_ppo_teacher/2026-09-03_01-21-56_all_ideas_ppo_teacher_resume300/model_1499.pt
+sampling_steps=16
+obs_dim=45
+action_dim=12
+variant=all_ideas_teacher_kd
+note=flow Euler steps baked into ONNX; adaptive predictor weights loaded but unused in graph

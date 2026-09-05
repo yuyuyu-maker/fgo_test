@@ -32,6 +32,7 @@ from lerobot.common.policies.pretrained import PreTrainedPolicy
 from src.dexmg_env import VectorizedEnvWrapper, create_vectorized_env
 from src.flow_model import FlowMatchingPolicy
 from src.flow_model_config import FlowMatchingConfig
+from src.gaussian_policy import GaussianChunkPolicy, distill_gaussian_from_flow
 
 # ---- Multiprocessing start method (CUDA compat) ------------------------------
 try:
@@ -51,7 +52,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FlowPPOConfig:
     task: str = "Lift"
-    loss_mode: Literal["fpo", "dppo"] = "fpo"
+    loss_mode: Literal["fpo", "dppo", "gaussian_ppo"] = "fpo"
     observation_type: str = "image"
     num_envs: int = 2
     reset_every_iteration: bool = True
@@ -108,6 +109,11 @@ class FlowPPOConfig:
     entropy_loss_coef: float = 0.001
     dppo_norm_factor: float = 1.0
     average_logprob_over_denoising_steps: bool = False # something like reinflow style
+
+    # Pure diagonal-Gaussian PPO (not DPPO / flow). Vision encoder still comes from BC.
+    gaussian_init_log_std: float = -2.302585  # log(0.1)
+    gaussian_hidden_dims: list[int] = field(default_factory=lambda: [1024, 1024, 1024])
+    gaussian_bc_init_epochs: int = 50
 
     # PPO-ish
     discount: float = 0.99
@@ -183,12 +189,12 @@ class FlowPPOConfig:
     adaptive_compute_enabled: bool = False
     adaptive_compute_loss_coef: float = 0.1
     adaptive_latency_penalty_coef: float = 1.0
-    adaptive_step_bins: list[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    adaptive_step_bins: list[int] = field(default_factory=lambda: [1, 2, 4])
     theory_metrics_enabled: bool = False
     reflow_teacher_checkpoint: Optional[str] = None
     teacher_kd_enabled: bool = False
     teacher_kd_coef: float = 0.1
-    teacher_kd_steps: list[int] = field(default_factory=lambda: [1, 4, 8])
+    teacher_kd_steps: list[int] = field(default_factory=lambda: [1, 2, 4])
     teacher_aux_zero_x0_prob: float = 0.25
 
     output_dir: Optional[str] = None
@@ -598,6 +604,17 @@ def download_checkpoint_from_wandb_rank0(
     return Path(artifact_dir)
 
 
+def few_step_bins_for(n_steps: int) -> list[int]:
+    """KD / adaptive bins vs full Euler budget.
+
+    Locomotion uses [1, 4, 8] against N=64. Arm FPO++ is N=10, so [1, 4, 8]
+    is almost full-horizon (8≈10) and the 1-step term dominates. Scale down.
+    """
+    n = int(n_steps)
+    candidates = [1, 4, 8] if n >= 32 else [1, 2, 4]
+    return [s for s in candidates if 0 < s < n]
+
+
 # ---- Main --------------------------------------------------------------------
 def apply_fpo_variant(cfg: "FlowPPOConfig") -> "FlowPPOConfig":
     """Map --fpo_variant to reflow/adaptive/theory flags (isaaclab_fpo-compatible)."""
@@ -617,6 +634,7 @@ def apply_fpo_variant(cfg: "FlowPPOConfig") -> "FlowPPOConfig":
     elif variant == "adaptive_compute":
         cfg.reflow_mode = "uniform"
         cfg.adaptive_compute_enabled = True
+        cfg.adaptive_step_bins = few_step_bins_for(cfg.sampling_steps)
     elif variant == "theory":
         cfg.reflow_mode = "uniform"
         cfg.theory_metrics_enabled = True
@@ -624,12 +642,17 @@ def apply_fpo_variant(cfg: "FlowPPOConfig") -> "FlowPPOConfig":
         cfg.reflow_mode = "uniform"
         cfg.teacher_kd_enabled = True
         cfg.reflow_use_ema_endpoint = False
+        cfg.teacher_kd_steps = few_step_bins_for(cfg.sampling_steps)
+        cfg.reflow_loss_coef = 0.1
     elif variant == "all_ideas_teacher_kd":
         cfg.reflow_mode = "reward_aware"
         cfg.teacher_kd_enabled = True
         cfg.adaptive_compute_enabled = True
         cfg.theory_metrics_enabled = True
         cfg.reflow_use_ema_endpoint = False
+        cfg.teacher_kd_steps = few_step_bins_for(cfg.sampling_steps)
+        cfg.adaptive_step_bins = few_step_bins_for(cfg.sampling_steps)
+        cfg.reflow_loss_coef = 0.1
     else:
         raise ValueError(f"Unknown fpo_variant: {variant}")
     return cfg
@@ -823,17 +846,18 @@ def main(cfg: FlowPPOConfig):
                     f"from base policy {getattr(actor, 'exploration_noise_std', None)}")
         actor.exploration_noise_std = cfg.exploration_noise_std
 
-    if cfg.sde_sigma is not None:
-        logger.info(f"[Rank {rank}] Overriding sde_sigma to {cfg.sde_sigma} in actor config "
-                    f"from base policy {getattr(actor, 'config.sde_sigma', None)}")
-        actor.config.sde_sigma = cfg.sde_sigma
-    if cfg.learn_sde_sigma:
-        logger.info(f"[Rank {rank}] Overriding learn_sde_sigma to {cfg.learn_sde_sigma} in actor config "
-                    f"from base policy {getattr(actor, 'config.learn_sde_sigma', None)}")
-        actor.config.learn_sde_sigma = cfg.learn_sde_sigma
-        actor.config.noise_injection_min = cfg.noise_injection_min
-        actor.config.noise_injection_max = cfg.noise_injection_max
-        actor.initialize_noise_injection_network()
+    if cfg.loss_mode == "dppo":
+        if cfg.sde_sigma is not None:
+            logger.info(f"[Rank {rank}] Overriding sde_sigma to {cfg.sde_sigma} in actor config "
+                        f"from base policy {getattr(actor, 'config.sde_sigma', None)}")
+            actor.config.sde_sigma = cfg.sde_sigma
+        if cfg.learn_sde_sigma:
+            logger.info(f"[Rank {rank}] Overriding learn_sde_sigma to {cfg.learn_sde_sigma} in actor config "
+                        f"from base policy {getattr(actor, 'config.learn_sde_sigma', None)}")
+            actor.config.learn_sde_sigma = cfg.learn_sde_sigma
+            actor.config.noise_injection_min = cfg.noise_injection_min
+            actor.config.noise_injection_max = cfg.noise_injection_max
+            actor.initialize_noise_injection_network()
 
     assert actor.config.n_action_steps == cfg.n_action_steps
     assert cfg.n_action_steps <= actor.config.horizon, \
@@ -853,6 +877,21 @@ def main(cfg: FlowPPOConfig):
         logger.info(colored(f"[Rank {rank}] Freezing vision encoder", "cyan"))
         for p in actor.model.vision_encoder.parameters():
             p.requires_grad = False
+
+    if cfg.loss_mode == "gaussian_ppo":
+        for p in actor.parameters():
+            p.requires_grad = False
+        actor = GaussianChunkPolicy(
+            flow_policy=actor,
+            init_log_std=cfg.gaussian_init_log_std,
+            hidden_dims=cfg.gaussian_hidden_dims,
+        )
+        actor.to(device)
+        logger.info(colored(
+            f"[Rank {rank}] Gaussian PPO actor: frozen BC encoder + MLP μ(s), "
+            f"diag σ init={cfg.gaussian_init_log_std:.3f}",
+            "cyan",
+        ))
 
     # Wrap with DDP
     if is_ddp:
@@ -881,35 +920,73 @@ def main(cfg: FlowPPOConfig):
                 f"prediction horizon: {actor_module.config.horizon}")
     logger.info(f"[Rank {rank}] Critic: {critic}")
 
-    if cfg.teacher_kd_enabled or cfg.reflow_teacher_checkpoint:
+    if cfg.loss_mode != "gaussian_ppo" and (cfg.teacher_kd_enabled or cfg.reflow_teacher_checkpoint):
         teacher_sd = None
-        teacher_path = cfg.reflow_teacher_checkpoint or cfg.base_policy_local_path
+        teacher_path = cfg.reflow_teacher_checkpoint
+        if cfg.teacher_kd_enabled and not teacher_path:
+            raise RuntimeError(
+                "teacher_kd_enabled requires --reflow_teacher_checkpoint pointing at a "
+                "trained FPO++ baseline or Gaussian PPO checkpoint (not the BC init weights)"
+            )
         if teacher_path:
             tdir = Path(teacher_path)
-            weights = tdir / "policy" / "model.safetensors"
+            policy_dir = tdir / "policy" if (tdir / "policy").exists() else tdir
+            gaussian_head = policy_dir / "gaussian_head.pt"
+            weights = policy_dir / "model.safetensors"
             if not weights.exists():
                 weights = tdir / "model.safetensors"
-            if weights.exists():
+
+            if gaussian_head.exists() and cfg.teacher_kd_enabled:
+                # Gaussian PPO teacher: KD to μ(s); reflow stays on the student.
+                from src.gaussian_policy import GaussianChunkPolicy
+
+                if not weights.exists():
+                    raise RuntimeError(
+                        f"PPO teacher missing model.safetensors next to {gaussian_head}"
+                    )
+                teacher_flow = copy.deepcopy(actor_module)
+                teacher_sd = load_file(str(weights), device="cpu")
+                teacher_flow.load_state_dict(teacher_sd, strict=False)
+                ppo_teacher = GaussianChunkPolicy(flow_policy=teacher_flow)
+                ppo_teacher.load_gaussian_head(gaussian_head)
+                ppo_teacher.to(device)
+                actor_module.attach_frozen_ppo_teacher(ppo_teacher)
+                logger.info(
+                    colored(
+                        f"[Rank {rank}] Frozen Gaussian PPO teacher from {policy_dir} "
+                        f"(KD only; reflow endpoints stay on student)",
+                        "cyan",
+                    )
+                )
+            elif weights.exists():
                 teacher_sd = load_file(str(weights), device="cpu")
                 logger.info(
                     colored(
-                        f"[Rank {rank}] Loading frozen teacher from {weights}",
+                        f"[Rank {rank}] Loading frozen flow teacher from {weights}",
                         "cyan",
                     )
+                )
+                actor_module.attach_frozen_teacher(teacher_sd)
+            elif cfg.teacher_kd_enabled:
+                raise RuntimeError(
+                    f"teacher checkpoint has no model.safetensors: {teacher_path}"
                 )
             else:
                 logger.warning(
                     f"[Rank {rank}] reflow_teacher_checkpoint has no model.safetensors "
-                    f"({teacher_path}); copying online actor as teacher"
+                    f"({teacher_path}); skipping frozen teacher"
                 )
-        actor_module.attach_frozen_teacher(teacher_sd)
-        if cfg.teacher_kd_enabled and actor_module.__dict__.get("_teacher_model") is None:
+        if cfg.teacher_kd_enabled and (
+            actor_module.__dict__.get("_teacher_model") is None
+            and actor_module.__dict__.get("_ppo_teacher") is None
+        ):
             raise RuntimeError("teacher_kd_enabled requires a frozen teacher")
         logger.info(
             colored(
                 f"[Rank {rank}] Frozen teacher attached "
                 f"(kd={cfg.teacher_kd_enabled}, kd_steps={cfg.teacher_kd_steps}, "
-                f"aux_zero_x0_prob={cfg.teacher_aux_zero_x0_prob})",
+                f"aux_zero_x0_prob={cfg.teacher_aux_zero_x0_prob}, "
+                f"ppo={actor_module.__dict__.get('_ppo_teacher') is not None})",
                 "green",
             )
         )
@@ -959,6 +1036,13 @@ def main(cfg: FlowPPOConfig):
     actor_module.init_action_buffers(num_envs_per_process)
     logger.info(colored(f"[Rank {rank}] Initialized action buffers for {num_envs_per_process} environments", "green"))
 
+    if cfg.loss_mode == "gaussian_ppo" and cfg.gaussian_bc_init_epochs > 0:
+        logger.info(colored(
+            f"[Rank {rank}] Distilling Gaussian μ from frozen flow BC for {cfg.gaussian_bc_init_epochs} chunks",
+            "cyan",
+        ))
+        distill_gaussian_from_flow(actor_module, env, cfg.gaussian_bc_init_epochs, logger)
+
     # Obs/action dims
     joint_pos_dim = env.observation_space["observation.state"].shape[1]
     action_dim = env.action_space.shape[1]
@@ -969,11 +1053,11 @@ def main(cfg: FlowPPOConfig):
                 f"Image keys: {image_keys} | Image shape: ({img_c},{img_h},{img_w}) | n_images={n_images}")
 
     # ----------------- Optimizers / sched ----------------
-    if cfg.adaptive_compute_enabled:
+    if cfg.adaptive_compute_enabled and cfg.loss_mode != "gaussian_ppo":
         actor_module.ensure_step_predictor(cfg.adaptive_step_bins)
         logger.info(f"[Rank {rank}] Initialized StepPredictor bins={cfg.adaptive_step_bins}")
 
-    params_actor = actor.parameters()
+    params_actor = [p for p in actor.parameters() if p.requires_grad]
     optimizer_actor = optim.AdamW(
         params_actor,
         lr=cfg.learning_rate_actor,
@@ -1058,6 +1142,7 @@ def main(cfg: FlowPPOConfig):
     cfm_loss_epsilons_stored = torch.zeros((steps_per_iteration, num_envs_per_process, n_action_samples, action_dim))
     cfm_value_invalid_stored = torch.zeros((steps_per_iteration, num_envs_per_process))
     dppo_log_probs_stored = torch.zeros((steps_per_iteration, actor_module.config.sampling_steps, num_envs_per_process))
+    gaussian_log_probs_stored = torch.zeros((steps_per_iteration, num_envs_per_process))
 
     next_done = torch.zeros(num_envs_per_process)
     next_obs, _ = env.reset()
@@ -1141,6 +1226,8 @@ def main(cfg: FlowPPOConfig):
                     values_stored[step] = value.flatten().cpu()
                     actions_stored[step] = action.cpu()
                     mdp_x_t_paths_stored[step] = mdp_x_t_path.permute(1, 0, 2).cpu()
+                    if cfg.loss_mode == "gaussian_ppo" and actor_module.last_step_log_prob is not None:
+                        gaussian_log_probs_stored[step] = actor_module.last_step_log_prob.detach().cpu()
                     rewards_stored[step] = reward.view(-1).cpu()
                     next_done = next_done.view(-1).cpu()
 
@@ -1173,26 +1260,18 @@ def main(cfg: FlowPPOConfig):
                 curr_obs_chunk = first_obs_from_chunk
                 curr_obs_chunk["action"] = actions_stored[step - action_idx:step].permute(1, 0, 2).to(device)
 
-                # actions_stored
-                # curr_obs_chunk["action"] = actions_stored[step - horizon:step] 
-                
-                # For FPO finetuning
-                cfm_loss, cfm_loss_t, cfm_loss_eps = get_cfm_values(
-                    actor, curr_obs_chunk, n_action_samples
-                )
-                cfm_losses_stored[step - action_idx:step] = cfm_loss.cpu()
-                cfm_loss_ts_stored[step - action_idx:step] = cfm_loss_t.cpu()
-                cfm_loss_epsilons_stored[step - action_idx:step] = cfm_loss_eps.cpu()
+                if cfg.loss_mode == "fpo":
+                    cfm_loss, cfm_loss_t, cfm_loss_eps = get_cfm_values(
+                        actor, curr_obs_chunk, n_action_samples
+                    )
+                    cfm_losses_stored[step - action_idx:step] = cfm_loss.cpu()
+                    cfm_loss_ts_stored[step - action_idx:step] = cfm_loss_t.cpu()
+                    cfm_loss_epsilons_stored[step - action_idx:step] = cfm_loss_eps.cpu()
+                elif cfg.loss_mode == "dppo":
+                    curr_obs_chunk["mdp_x_t_path"] = mdp_x_t_paths_stored[step - action_idx:step].permute(2, 0, 1, 3).to(device)
+                    dppo_log_prob, dppo_entropy, dppo_sde_sigma = get_log_prob_and_entropy(actor, curr_obs_chunk)
+                    dppo_log_probs_stored[step - action_idx:step] = dppo_log_prob.permute(1, 2, 0).cpu()
 
-                # For DPPO finetuning
-                # mdp_x_t_paths_stored: (n_action_steps, sampling_steps, num_envs_per_process, action_dim) 
-                # ->: (num_envs_per_process, n_action_steps, sampling_steps, action_dim)
-                curr_obs_chunk["mdp_x_t_path"] = mdp_x_t_paths_stored[step - action_idx:step].permute(2, 0, 1, 3).to(device)
-                dppo_log_prob, dppo_entropy, dppo_sde_sigma = get_log_prob_and_entropy(actor, curr_obs_chunk) # dppo_log_prob: (num_envs, horizon, sampling_steps)
-                dppo_log_probs_stored[step - action_idx:step] = dppo_log_prob.permute(1, 2, 0).cpu()
-                # dppo_entropy and dppo_sde_sigma are not stored during data collection, only used during training
-
-                # Should be used both for FPO and DPPO finetuning
                 chunk_dones = dones_stored[step - action_idx:step]
                 cfm_value_invalid_chunk = cfm_value_invalid_stored[step - action_idx:step]
                 for i in range(num_envs_per_process):
@@ -1235,6 +1314,9 @@ def main(cfg: FlowPPOConfig):
 
         b_dppo_log_probs = dppo_log_probs_stored.reshape(-1, n_action_steps, actor_module.config.sampling_steps, num_envs_per_process)
         b_dppo_log_probs = b_dppo_log_probs.permute(0, 3, 1, 2).reshape(-1, n_action_steps, actor_module.config.sampling_steps)
+
+        b_gaussian_log_probs = gaussian_log_probs_stored.reshape(-1, n_action_steps, num_envs_per_process)
+        b_gaussian_log_probs = b_gaussian_log_probs.permute(0, 2, 1).reshape(-1, n_action_steps)
 
         b_mdp_x_t_paths = mdp_x_t_paths_stored.reshape(-1, n_action_steps, actor_module.config.sampling_steps, num_envs_per_process, action_dim)
         b_mdp_x_t_paths = b_mdp_x_t_paths.permute(0, 3, 1, 2, 4).reshape(-1, n_action_steps, actor_module.config.sampling_steps, action_dim)
@@ -1284,6 +1366,8 @@ def main(cfg: FlowPPOConfig):
         actor.train(); critic.train()
         if cfg.freeze_vision_encoder:
             actor_module.model.vision_encoder.eval()
+        if cfg.loss_mode == "gaussian_ppo":
+            actor_module.flow.eval()
 
         # Initialize gradient norm tracking
         actor_grad_norm_before = torch.tensor(0.0)
@@ -1307,6 +1391,7 @@ def main(cfg: FlowPPOConfig):
                 mb_cfm_loss_ts = b_cfm_loss_ts[mb_inds].to(device)
                 mb_cfm_loss_epsilons = b_cfm_loss_epsilons[mb_inds].to(device)
                 mb_dppo_log_probs = b_dppo_log_probs[mb_inds].to(device)
+                mb_gaussian_log_probs = b_gaussian_log_probs[mb_inds].to(device)
                 mb_mdp_x_t_paths = b_mdp_x_t_paths[mb_inds].to(device)
                 mb_cfm_value_invalid = b_cfm_value_invalid[mb_inds].to(device)
                 mb_advantages = b_advantages[mb_inds].to(device)
@@ -1421,6 +1506,19 @@ def main(cfg: FlowPPOConfig):
                     # Do chunk level PPO
                     mb_advantages = mb_advantages[:, 0:1]
 
+                elif cfg.loss_mode == "gaussian_ppo":
+                    obs_chunk2 = {k: mb_obs_images[k][:, 0] for k in mb_obs_images.keys()}
+                    obs_chunk2["observation.state"] = mb_obs_state[:, 0]
+                    obs_chunk2["action"] = mb_actions
+                    log_prob, entropy = actor_module.evaluate_actions(obs_chunk2)
+                    log_prob_valid = log_prob * valid_idx_mask_in_chunk
+                    old_lp_valid = mb_gaussian_log_probs * valid_idx_mask_in_chunk
+                    log_prob_chunk = log_prob_valid.sum(dim=1, keepdim=True)
+                    old_log_prob_chunk = old_lp_valid.sum(dim=1, keepdim=True)
+                    log_ratio = log_prob_chunk - old_log_prob_chunk
+                    ratio = log_ratio.exp()
+                    mb_advantages = mb_advantages[:, 0:1]
+
                 else:
                     raise ValueError(f"Invalid loss mode: {cfg.loss_mode}")
 
@@ -1481,7 +1579,7 @@ def main(cfg: FlowPPOConfig):
                 v_loss = v_loss[valid_idx_mask_in_chunk == 1].mean()
 
                 # Total loss
-                entropy_loss = -entropy.mean() if cfg.learn_sde_sigma and isinstance(entropy, torch.Tensor) else 0.0
+                entropy_loss = -entropy.mean() if isinstance(entropy, torch.Tensor) else 0.0
                 policy_loss = pg_loss + cfg.entropy_loss_coef * entropy_loss if iteration > cfg.n_iterations_train_only_value else 0.0
                 loss = (policy_loss + v_loss * cfg.vf_coef) / cfg.gradient_accumulation_steps
 
@@ -1592,10 +1690,11 @@ def main(cfg: FlowPPOConfig):
                 "cfm/ratio_std": float(ratio.std().item()),
                 "cfm/ratio_min": float(ratio.min().item()),
                 "cfm/ratio_max": float(ratio.max().item()),
-                "cfm/old_cfm_loss_hist": wandb.Histogram(old_cfm_loss.detach().cpu().numpy().flatten()),
-                "cfm/curr_cfm_loss_hist": wandb.Histogram(curr_cfm_loss.detach().cpu().numpy().flatten()),
             }
-        else:  # dppo
+            if cfg.wandb_enable:
+                cfm_metrics["cfm/old_cfm_loss_hist"] = wandb.Histogram(old_cfm_loss.detach().cpu().numpy().flatten())
+                cfm_metrics["cfm/curr_cfm_loss_hist"] = wandb.Histogram(curr_cfm_loss.detach().cpu().numpy().flatten())
+        elif cfg.loss_mode == "dppo":
             cfm_metrics = {
                 "dppo/log_prob_chunk_mean": float(log_prob_chunk.mean().item()),
                 "dppo/log_prob_chunk_std": float(log_prob_chunk.std().item()),
@@ -1614,14 +1713,21 @@ def main(cfg: FlowPPOConfig):
                 "dppo/sde_sigma_min": float(sde_sigma.min().item()),
                 "dppo/sde_sigma_max": float(sde_sigma.max().item()),
             }
-            # Add entropy metrics (handles both learned and fixed sigma cases)
             if cfg.learn_sde_sigma and isinstance(entropy, torch.Tensor):
-                # Learned sigma: entropy has shape (B, T)
                 cfm_metrics["dppo/entropy_mean"] = float(entropy.mean().item())
                 cfm_metrics["dppo/entropy_std"] = float(entropy.std().item())
             else:
-                # Fixed sigma: entropy is scalar 0.0
                 cfm_metrics["dppo/entropy_mean"] = float(entropy.item()) if isinstance(entropy, torch.Tensor) else float(entropy)
+        else:
+            cfm_metrics = {
+                "gaussian/log_prob_chunk_mean": float(log_prob_chunk.mean().item()),
+                "gaussian/old_log_prob_chunk_mean": float(old_log_prob_chunk.mean().item()),
+                "gaussian/log_ratio_mean": float(log_ratio.mean().item()),
+                "gaussian/ratio_mean": float(ratio.mean().item()),
+                "gaussian/ratio_std": float(ratio.std().item()),
+                "gaussian/entropy_mean": float(entropy.mean().item()) if isinstance(entropy, torch.Tensor) else 0.0,
+                "gaussian/std_mean": float(actor_module.std().mean().item()),
+            }
 
         training_cum_time += time.time() - iteration_start_time
         sps_local_cum = int((steps_per_iteration * num_envs_per_process) / (training_cum_time / max(1, iteration)))
@@ -1847,5 +1953,3 @@ def main(cfg: FlowPPOConfig):
 if __name__ == "__main__":
     args_cli = tyro.cli(FlowPPOConfig, config=(tyro.conf.FlagConversionOff,))
     main(args_cli)
-
-

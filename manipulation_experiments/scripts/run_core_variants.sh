@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Dual-GPU core set only: baseline FPO++ / reflow / all_ideas_teacher_kd.
+# Dual-GPU core set: baseline FPO++ / reflow / all_ideas_teacher_kd.
+# Teacher for all_ideas is the trained FPO++ baseline (eval-best), not BC.
+# all_ideas writes *rlteacher* run dirs so the old BC-teacher runs are kept.
 #
 #   GPU0: Can -> TwoArmBoxCleanup
 #   GPU1: Square -> TwoArmLiftTray -> TwoArmThreading
 #
 # Reuses STAMP=2026-08-26_22-18-01 so finished Can/Square reflow runs are skipped.
-# Speed: keep 30 MuJoCo envs (FUSE cannot spawn 64x2), eval every 10 iters x 40 episodes.
+# Speed: 30 envs on Can/Square. Two-arm tasks use 12: pod memcg is 200GiB and
+# 30+30 two-arm MuJoCo workers OOM (SIGKILL). Eval every 10 iters x 40 episodes.
 # GPU1 spawn is delayed 90s so both jobs do not livelock bosfs at once.
 #
 # Usage:

@@ -24,11 +24,7 @@ log = logging.getLogger("go2_deploy.fpo")
 
 
 class FpoOnnxBackend(RobotBackend):
-    """50Hz FPO inference. Mock robot by default; optional SDK2 LowCmd.
-
-    ``apply_velocity`` only updates the velocity-command buffer used in obs.
-    The policy thread runs at ``policy_hz`` independently.
-    """
+    """50Hz FPO inference. Mock robot by default; optional SDK2 LowCmd."""
 
     name = "fpo_onnx"
 
@@ -68,7 +64,6 @@ class FpoOnnxBackend(RobotBackend):
         self._cmd_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._low_state = None
         self._low_pub = None
         self._crc = None
         self._last_log = 0.0
@@ -98,7 +93,6 @@ class FpoOnnxBackend(RobotBackend):
         self._low_cmd_msg = unitree_go_msg_dds__LowCmd_()
         self._low_pub = ChannelPublisher("rt/lowcmd", LowCmd_)
         self._low_pub.Init()
-
         self._latest_lowstate = None
         self._ls_lock = threading.Lock()
 
@@ -142,13 +136,11 @@ class FpoOnnxBackend(RobotBackend):
         st["onnx"] = self.onnx_path
         return st
 
-    def _read_robot_state_isaac(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return lin_vel, ang_vel, gravity, q_isaac, dq_isaac."""
+    def _read_robot_state_isaac(self):
         if self.hardware:
             with self._ls_lock:
                 msg = self._latest_lowstate
             if msg is None:
-                # No state yet — stand defaults
                 return (
                     np.zeros(3, np.float32),
                     np.zeros(3, np.float32),
@@ -157,17 +149,13 @@ class FpoOnnxBackend(RobotBackend):
                     np.zeros(12, np.float32),
                 )
             imu = msg.imu_state
-            quat = np.array(imu.quaternion, dtype=np.float32)  # wxyz
+            quat = np.array(imu.quaternion, dtype=np.float32)
             gyro = np.array(imu.gyroscope, dtype=np.float32)
-            # Go2 lowstate has no direct base lin vel; use zeros (common for proprio policies
-            # that were trained with lin_vel — sim2real gap; some stacks estimate from kinematics).
             lin = np.zeros(3, np.float32)
             grav = projected_gravity_from_quat_wxyz(quat)
             q_sdk = np.array([msg.motor_state[i].q for i in range(12)], dtype=np.float32)
             dq_sdk = np.array([msg.motor_state[i].dq for i in range(12)], dtype=np.float32)
             return lin, gyro, grav, sdk_to_isaac(q_sdk), sdk_to_isaac(dq_sdk)
-
-        # Mock: robot at default pose, zero rates, gravity down
         return (
             np.zeros(3, np.float32),
             np.zeros(3, np.float32),
@@ -224,20 +212,13 @@ class FpoOnnxBackend(RobotBackend):
             self._state.ticks += 1
             self._state.last_infer_ms = (time.perf_counter() - t0) * 1000.0
             self._publish_q_des_sdk(q_des)
-
             now = time.monotonic()
             if now - self._last_log >= 1.0:
                 log.info(
                     "fpo tick=%s infer=%.2fms cmd=(%.2f,%.2f,%.2f) action0=%.3f",
-                    self._state.ticks,
-                    self._state.last_infer_ms,
-                    vx,
-                    vy,
-                    yaw,
-                    float(action[0]),
+                    self._state.ticks, self._state.last_infer_ms, vx, vy, yaw, float(action[0]),
                 )
                 self._last_log = now
-
             next_t += dt
             sleep = next_t - time.monotonic()
             if sleep > 0:
